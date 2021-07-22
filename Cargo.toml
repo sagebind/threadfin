@@ -1,0 +1,13 @@
+[package]
+name = "factotum"
+version = "0.1.0"
+edition = "2018"
+
+[dependencies]
+atomic-waker = "1"
+crossbeam-channel = "0.5"
+crossbeam-deque = "0.8"
+crossbeam-utils = "0.8"
+log = "0.4"
+num_cpus = "1"
+once_cell = "1.8"
