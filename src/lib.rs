@@ -1,43 +1,81 @@
-use std::{
-    future::Future,
-    panic::{catch_unwind, AssertUnwindSafe},
-    pin::Pin,
-    sync::{atomic::AtomicUsize, Arc},
-    task::{Context, Poll},
-    thread,
-    time::Duration,
-};
+use std::{future::Future, sync::Arc, thread, time::Duration};
 
-use atomic_waker::AtomicWaker;
-use crossbeam_channel::{
-    bounded, select, unbounded, Receiver, RecvTimeoutError, Sender, TryRecvError,
-};
+use crossbeam_channel::{bounded, select, unbounded, Receiver, Sender};
 use crossbeam_utils::atomic::AtomicCell;
 use once_cell::sync::OnceCell;
+
+mod task;
+
+pub use task::Task;
+
+const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Default)]
 pub struct ThreadPoolBuilder {
     min_threads: Option<usize>,
     max_threads: Option<usize>,
+    idle_timeout: Option<Duration>,
     name: Option<String>,
     stack_size: Option<usize>,
 }
 
 impl ThreadPoolBuilder {
+    /// Set a custom thread name for threads spawned by this thread pool.
+    ///
+    /// The name must not contain null bytes (`\0`).
     pub fn name<T: Into<String>>(mut self, name: T) -> Self {
         self.name = Some(name.into());
         self
     }
 
+    /// Set the minimum number of threads.
+    ///
+    /// Panics if larger than `max_threads`.
+    pub fn min_threads(mut self, size: usize) -> Self {
+        if let Some(max) = self.max_threads {
+            if size > max {
+                panic!("thread pool min_threads cannot be larger than max_threads");
+            }
+        }
+
+        self.min_threads = Some(size);
+        self
+    }
+
+    /// Set the maximum number of threads.
+    ///
+    /// Panics if smaller than `min_threads`.
+    pub fn max_threads(mut self, size: usize) -> Self {
+        if let Some(min) = self.min_threads {
+            if size < min {
+                panic!("thread pool max_threads cannot be smaller than min_threads");
+            }
+        }
+
+        self.max_threads = Some(size);
+        self
+    }
+
+    /// Set the size of the stack (in bytes) for threads in this thread pool.
+    ///
+    /// The actual stack size may be greater than this value if the platform
+    /// specifies a minimal stack size.
+    pub fn stack_size(mut self, size: usize) -> Self {
+        self.stack_size = Some(size);
+        self
+    }
+
+    /// Create a thread pool according to the configuration set with this builder.
     pub fn build(self) -> ThreadPool {
         let min_threads = self.min_threads.unwrap_or_else(num_cpus::get);
         let max_threads = self.max_threads.unwrap_or(min_threads * 2);
 
-        let inner = Inner {
+        let shared = Shared {
             min_threads,
             max_threads,
             thread_count: Default::default(),
             completed_tasks_count: Default::default(),
+            idle_timeout: self.idle_timeout.unwrap_or(DEFAULT_IDLE_TIMEOUT),
         };
 
         let pool = ThreadPool {
@@ -45,7 +83,7 @@ impl ThreadPoolBuilder {
             stack_size: self.stack_size,
             immediate_channel: bounded(0),
             overflow_channel: unbounded(),
-            inner: Arc::new(inner),
+            shared: Arc::new(shared),
         };
 
         for _ in 0..min_threads {
@@ -56,18 +94,19 @@ impl ThreadPoolBuilder {
     }
 }
 
+/// A thread pool.
 #[derive(Debug)]
 pub struct ThreadPool {
     thread_name: Option<String>,
     stack_size: Option<usize>,
     immediate_channel: (Sender<Thunk>, Receiver<Thunk>),
     overflow_channel: (Sender<Thunk>, Receiver<Thunk>),
-    inner: Arc<Inner>,
+    shared: Arc<Shared>,
 }
 
 impl Default for ThreadPool {
     fn default() -> Self {
-        Self::builder().build()
+        Self::new()
     }
 }
 
@@ -78,13 +117,32 @@ impl ThreadPool {
         COMMON.get_or_init(|| Self::default())
     }
 
+    /// Create a new thread pool with the default configuration.
+    #[inline]
+    pub fn new() -> Self {
+        Self::builder().build()
+    }
+
+    /// Create a new thread pool with a custom name for its threads.
+    #[inline]
+    pub fn with_name<T: Into<String>>(name: T) -> Self {
+        Self::builder().name(name).build()
+    }
+
+    /// Get a builder for creating a customized thread pool.
+    #[inline]
     pub fn builder() -> ThreadPoolBuilder {
         ThreadPoolBuilder::default()
     }
 
-    /// Get the number of tasks completed since the pool was created.
+    /// Get the number of threads currently running in the thread pool.
+    pub fn threads(&self) -> usize {
+        self.shared.thread_count.load()
+    }
+
+    /// Get the number of tasks completed by this pool since it was created.
     pub fn completed_tasks(&self) -> u64 {
-        self.inner.completed_tasks_count.load()
+        self.shared.completed_tasks_count.load()
     }
 
     pub fn execute<T, F>(&self, f: F) -> Task<T>
@@ -139,7 +197,7 @@ impl ThreadPool {
                 debug_assert!(!e.is_disconnected());
 
                 // If possible, spawn an additional thread to handle the task.
-                if self.inner.thread_count.load() < self.inner.max_threads {
+                if self.shared.thread_count.load() < self.shared.max_threads {
                     self.spawn_thread(Some(e.into_inner()));
 
                     Ok(())
@@ -155,10 +213,7 @@ impl ThreadPool {
     /// If an initial thunk is given, it will be the first thunk the thread
     /// executes once ready for work.
     fn spawn_thread(&self, initial_thunk: Option<Thunk>) {
-        let immediate_receiver = self.immediate_channel.1.clone();
-        let overflow_receiver = self.overflow_channel.1.clone();
-        let inner = self.inner.clone();
-
+        // Configure the thread based on the thread pool configuration.
         let mut builder = thread::Builder::new();
 
         if let Some(name) = self.thread_name.as_ref() {
@@ -169,29 +224,16 @@ impl ThreadPool {
             builder = builder.stack_size(size);
         }
 
-        builder
-            .spawn(move || {
-                inner.thread_count.fetch_add(1);
+        self.shared.thread_count.fetch_add(1);
 
-                if let Some(thunk) = initial_thunk {
-                    thunk.execute();
-                    inner.completed_tasks_count.fetch_add(1);
-                }
+        let worker = Worker {
+            initial_thunk,
+            immediate_receiver: self.immediate_channel.1.clone(),
+            overflow_receiver: self.overflow_channel.1.clone(),
+            shared: self.shared.clone(),
+        };
 
-                // Select will return an error if the sender is disconnected. We
-                // want to stop naturally since this means the pool has been shut
-                // down.
-                while let Ok(thunk) = select! {
-                    recv(immediate_receiver) -> thunk => thunk,
-                    recv(overflow_receiver) -> thunk => thunk,
-                } {
-                    thunk.execute();
-                    inner.completed_tasks_count.fetch_add(1);
-                }
-
-                inner.thread_count.fetch_sub(1);
-            })
-            .unwrap();
+        builder.spawn(move || worker.run()).unwrap();
     }
 }
 
@@ -200,90 +242,21 @@ where
     T: Send + 'static,
     F: FnOnce() -> T + Send + 'static,
 {
-    let (value_tx, value_rx) = bounded(1);
-    let waker = Arc::new(AtomicWaker::new());
-    let waker_weak = Arc::downgrade(&waker);
-    let task = Task {
-        receiver: value_rx,
-        waker: waker,
-    };
+    let (task, completer) = Task::new();
 
-    let thunk = Thunk::new(move || {
-        if let Some(waker) = waker_weak.upgrade() {
-            let result = catch_unwind(AssertUnwindSafe(f));
-
-            if value_tx.send(result).is_ok() {
-                waker.wake();
-            }
-        } else {
-            log::trace!("task canceled before it could run, ignoring");
-        }
-    });
+    let thunk = Thunk::new(move || completer.complete(f));
 
     (thunk, task)
 }
 
+/// Thread pool state shared by the owner and the worker threads.
 #[derive(Debug)]
-struct Inner {
+struct Shared {
     min_threads: usize,
     max_threads: usize,
     thread_count: AtomicCell<usize>,
     completed_tasks_count: AtomicCell<u64>,
-}
-
-/// A type of future representing the result of a background computation in a
-/// thread pool.
-///
-/// Tasks implement [`Future`], so you can `.await` their completion
-/// asynchronously. Or, you can wait for their completion synchronously using
-/// the various methods provided.
-///
-/// If a task is dropped before it can be executed then its execution will be
-/// canceled. Canceling a synchronous closure after it has already started will
-/// have no effect.
-pub struct Task<T: Send> {
-    receiver: Receiver<thread::Result<T>>,
-    waker: Arc<AtomicWaker>,
-}
-
-impl<T: Send> Task<T> {
-    pub fn is_done(&self) -> bool {
-        !self.receiver.is_empty()
-    }
-
-    pub fn try_get(&mut self) -> Option<thread::Result<T>> {
-        match self.receiver.try_recv() {
-            Ok(result) => Some(result),
-            Err(TryRecvError::Empty) => None,
-            Err(e) => Some(Err(Box::new(e))),
-        }
-    }
-
-    pub fn get(self) -> thread::Result<T> {
-        self.receiver.recv().unwrap()
-    }
-
-    pub fn get_timeout(self, timeout: Duration) -> Result<thread::Result<T>, Self> {
-        match self.receiver.recv_timeout(timeout) {
-            Ok(result) => Ok(result),
-            Err(RecvTimeoutError::Timeout) => Err(self),
-            Err(e) => Ok(Err(Box::new(e))),
-        }
-    }
-}
-
-impl<T: Send> Future for Task<T> {
-    type Output = thread::Result<T>;
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        self.waker.register(cx.waker());
-
-        match self.receiver.try_recv() {
-            Ok(result) => Poll::Ready(result),
-            Err(TryRecvError::Empty) => Poll::Pending,
-            Err(e) => Poll::Ready(Err(Box::new(e))),
-        }
-    }
+    idle_timeout: Duration,
 }
 
 /// Wrapper around closures that can be run by worker threads.
@@ -299,9 +272,60 @@ impl Thunk {
     }
 }
 
+struct Worker {
+    initial_thunk: Option<Thunk>,
+    immediate_receiver: Receiver<Thunk>,
+    overflow_receiver: Receiver<Thunk>,
+    shared: Arc<Shared>,
+}
+
+impl Worker {
+    fn run(mut self) {
+        if let Some(thunk) = self.initial_thunk.take() {
+            self.execute_thunk(thunk);
+        }
+
+        // Select will return an error if the sender is disconnected. We
+        // want to stop naturally since this means the pool has been shut
+        // down.
+        while let Ok(thunk) = select! {
+            recv(self.immediate_receiver) -> thunk => thunk,
+            recv(self.overflow_receiver) -> thunk => thunk,
+            default(self.shared.idle_timeout) => {
+                todo!("terminate worker if over min_threads");
+            }
+        } {
+            self.execute_thunk(thunk);
+        }
+    }
+
+    fn execute_thunk(&self, thunk: Thunk) {
+        thunk.execute();
+        self.shared.completed_tasks_count.fetch_add(1);
+    }
+}
+
+impl Drop for Worker {
+    fn drop(&mut self) {
+        self.shared.thread_count.fetch_sub(1);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[should_panic(expected = "thread pool min_threads cannot be larger than max_threads")]
+    fn test_setting_min_threads_larger_than_max_threads_panics() {
+        ThreadPool::builder().max_threads(1).min_threads(2);
+    }
+
+    #[test]
+    #[should_panic(expected = "thread pool max_threads cannot be smaller than min_threads")]
+    fn test_setting_max_threads_smaller_than_min_threads_panics() {
+        ThreadPool::builder().min_threads(2).max_threads(1);
+    }
 
     #[test]
     fn test_execute() {
@@ -313,8 +337,34 @@ mod tests {
     }
 
     #[test]
+    fn test_try_execute_under_core_count() {
+        let pool = ThreadPool::builder().min_threads(1).max_threads(1).build();
+
+        // Give some time for thread to start...
+        thread::sleep(Duration::from_millis(50));
+        assert_eq!(pool.threads(), 1);
+
+        assert!(pool.try_execute(|| 2 + 2).is_some());
+    }
+
+    #[test]
+    fn test_try_execute_over_core_count() {
+        let pool = ThreadPool::builder().min_threads(0).max_threads(1).build();
+
+        assert!(pool.try_execute(|| 2 + 2).is_some());
+    }
+
+    #[test]
+    fn test_try_execute_over_max_count() {
+        let pool = ThreadPool::builder().min_threads(0).max_threads(1).build();
+
+        assert!(pool.try_execute(|| 2 + 2).is_some());
+        assert!(pool.try_execute(|| 2 + 2).is_none());
+    }
+
+    #[test]
     fn test_name() {
-        let pool = ThreadPool::builder().name("foo").build();
+        let pool = ThreadPool::with_name("foo");
 
         let name = pool
             .execute(|| thread::current().name().unwrap().to_owned())
@@ -325,11 +375,39 @@ mod tests {
     }
 
     #[test]
-    fn test_panic() {
+    fn test_panic_fails_task() {
         let pool = ThreadPool::default();
 
         let result = pool.execute(|| panic!("oh no!")).get();
 
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_thread_count() {
+        let pool = ThreadPool::builder().min_threads(0).max_threads(1).build();
+
+        assert_eq!(pool.threads(), 0);
+
+        pool.execute(|| 2 + 2).get().unwrap();
+        assert_eq!(pool.threads(), 1);
+
+        let pool_with_starting_threads = ThreadPool::builder().min_threads(1).build();
+
+        // Give some time for thread to start...
+        thread::sleep(Duration::from_millis(50));
+        assert_eq!(pool_with_starting_threads.threads(), 1);
+    }
+
+    #[test]
+    fn test_tasks_completed() {
+        let pool = ThreadPool::default();
+        assert_eq!(pool.completed_tasks(), 0);
+
+        pool.execute(|| 2 + 2).get().unwrap();
+        assert_eq!(pool.completed_tasks(), 1);
+
+        pool.execute(|| 2 + 2).get().unwrap();
+        assert_eq!(pool.completed_tasks(), 2);
     }
 }
