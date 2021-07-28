@@ -1,12 +1,4 @@
-use std::{
-    future::Future,
-    panic::{catch_unwind, AssertUnwindSafe},
-    pin::Pin,
-    sync::{Arc, Weak},
-    task::{Context, Poll},
-    thread,
-    time::Duration,
-};
+use std::{future::Future, panic::{AssertUnwindSafe, catch_unwind, resume_unwind}, pin::Pin, sync::{Arc, Weak}, task::{Context, Poll}, thread, time::Duration};
 
 use atomic_waker::AtomicWaker;
 use crossbeam_channel::{bounded, Receiver, RecvTimeoutError, Sender, TryRecvError};
@@ -55,29 +47,47 @@ impl<T: Send> Task<T> {
         }
     }
 
-    pub fn get(self) -> thread::Result<T> {
-        self.receiver.recv().unwrap()
+    /// Block the current thread until the task completes.
+    ///
+    /// # Panics
+    ///
+    /// If the closure the task was created from panics, the panic will
+    /// propagate to this call.
+    pub fn get(self) -> T {
+        match self.receiver.recv().unwrap() {
+            Ok(value) => value,
+            Err(e) => resume_unwind(e),
+        }
     }
 
-    pub fn get_timeout(self, timeout: Duration) -> Result<thread::Result<T>, Self> {
+    /// Block the current thread until the task completes or a timeout is
+    /// reached.
+    ///
+    /// # Panics
+    ///
+    /// If the closure the task was created from panics, the panic will
+    /// propagate to this call.
+    pub fn get_timeout(self, timeout: Duration) -> Result<T, Self> {
         match self.receiver.recv_timeout(timeout) {
-            Ok(result) => Ok(result),
+            Ok(Ok(value)) => Ok(value),
+            Ok(Err(e)) => resume_unwind(e),
             Err(RecvTimeoutError::Timeout) => Err(self),
-            Err(e) => Ok(Err(Box::new(e))),
+            Err(RecvTimeoutError::Disconnected) => panic!("task was dropped by thread pool without being completed"),
         }
     }
 }
 
 impl<T: Send> Future for Task<T> {
-    type Output = thread::Result<T>;
+    type Output = T;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         self.waker.register(cx.waker());
 
         match self.receiver.try_recv() {
-            Ok(result) => Poll::Ready(result),
+            Ok(Ok(value)) => Poll::Ready(value),
+            Ok(Err(e)) => resume_unwind(e),
             Err(TryRecvError::Empty) => Poll::Pending,
-            Err(e) => Poll::Ready(Err(Box::new(e))),
+            Err(TryRecvError::Disconnected) => panic!("task was dropped by thread pool without being completed"),
         }
     }
 }
