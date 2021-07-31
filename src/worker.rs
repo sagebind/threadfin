@@ -75,9 +75,6 @@ impl<L: Listener> Worker<L> {
                 recv(self.immediate_queue) -> runner => {
                     if let Ok(runner) = runner {
                         self.run_now_or_reschedule(runner);
-                    } else {
-                        // todo!("pool closed, shut down worker");
-                        break;
                     }
                 }
                 recv(self.wake_notifications.1) -> id => {
@@ -140,7 +137,14 @@ impl<L: Listener> Worker<L> {
             debug_assert!(runner.might_yield());
 
             // Task yielded, so we'll need to reschedule the task to be polled
-            // again when its waker is called.
+            // again when its waker is called. We do this by storing the future
+            // in a collection local to this worker where we can retrieve it
+            // again.
+            //
+            // The benefit of doing it this way instead of sending the future
+            // back through the queue is that the future gets executed (almost)
+            // immediately once it wakes instead of being put behind a queue of
+            // _new_ tasks.
             vacant_entry.insert(runner);
         }
     }

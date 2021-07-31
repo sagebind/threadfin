@@ -23,16 +23,26 @@ pub use task::Task;
 
 use crate::worker::Listener;
 
-const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(6);
-
 /// A builder for constructing a customized thread pool.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct ThreadPoolBuilder {
-    size: Option<ThreadPoolSize>,
-    idle_timeout: Option<Duration>,
     name: Option<String>,
+    size: Option<ThreadPoolSize>,
     stack_size: Option<usize>,
     queue_limit: Option<usize>,
+    idle_timeout: Duration,
+}
+
+impl Default for ThreadPoolBuilder {
+    fn default() -> Self {
+        Self {
+            name: None,
+            size: None,
+            stack_size: None,
+            queue_limit: None,
+            idle_timeout: Duration::from_secs(60),
+        }
+    }
 }
 
 impl ThreadPoolBuilder {
@@ -123,7 +133,7 @@ impl ThreadPoolBuilder {
             thread_count: Default::default(),
             running_tasks_count: Default::default(),
             completed_tasks_count: Default::default(),
-            idle_timeout: self.idle_timeout.unwrap_or(DEFAULT_IDLE_TIMEOUT),
+            idle_timeout: self.idle_timeout,
             shutdown_cvar: Condvar::new(),
         };
 
@@ -307,8 +317,8 @@ impl ThreadPool {
     }
 
     fn join_internal(self, deadline: Option<Instant>) -> bool {
-        // Dropping these channels will interrupt any idle workers and prevent
-        // new tasks from being scheduled.
+        // Closing this channel will interrupt any idle workers and signal to
+        // all workers that the pool is shutting down.
         drop(self.queue.0);
 
         let mut thread_count = self.shared.thread_count.lock().unwrap();
@@ -405,6 +415,7 @@ impl ThreadPool {
 impl fmt::Debug for ThreadPool {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ThreadPool")
+            .field("queued_tasks", &self.queued_tasks())
             .field("running_tasks", &self.running_tasks())
             .field("completed_tasks", &self.completed_tasks())
             .finish()
@@ -474,6 +485,15 @@ mod tests {
         let pool = ThreadPool::default();
 
         let result = pool.execute(|| 2 + 2).get();
+
+        assert_eq!(result, 4);
+    }
+
+    #[test]
+    fn test_execute_async() {
+        let pool = ThreadPool::default();
+
+        let result = pool.execute_future(async { 2 + 2 }).get();
 
         assert_eq!(result, 4);
     }

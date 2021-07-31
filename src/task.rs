@@ -34,34 +34,12 @@ impl<T: Send> Task<T> {
         F: FnOnce() -> T + Send + 'static,
         T: 'static,
     {
-        let (tx, rx) = bounded(1);
-
-        let task = Task {
-            receiver: rx,
-            waker: Arc::new(AtomicWaker::new()),
-        };
-
         let mut closure = Some(closure);
-        let mut tx = Some(tx);
 
-        let coroutine = Coroutine {
-            might_yield: false,
-            complete: false,
-            waker: empty_waker(),
-            task_waker: task.waker.clone(),
-            poll: Box::new(move |_cx| {
-                let closure = closure.take().unwrap();
-                let result = catch_unwind(AssertUnwindSafe(closure));
-
-                if tx.take().unwrap().send(result).is_err() {
-                    log::trace!("task canceled before it could run, ignoring");
-                }
-
-                true
-            }),
-        };
-
-        (task, coroutine)
+        Self::new(false, move |_cx| {
+            let closure = closure.take().unwrap();
+            Some(catch_unwind(AssertUnwindSafe(closure)))
+        })
     }
 
     /// Create a new asynchronous task from a future.
@@ -71,6 +49,25 @@ impl<T: Send> Task<T> {
         T: 'static,
     {
         let mut future = Box::pin(future);
+
+        Self::new(true, move |cx| {
+            let future = future.as_mut();
+
+            match catch_unwind(AssertUnwindSafe(|| future.poll(cx))) {
+                Ok(Poll::Pending) => None,
+                Ok(Poll::Ready(value)) => Some(Ok(value)),
+                Err(e) => Some(Err(e)),
+            }
+        })
+    }
+
+    fn new(
+        might_yield: bool,
+        mut poll: impl FnMut(&mut Context) -> Option<thread::Result<T>> + Send + 'static,
+    ) -> (Self, Coroutine)
+    where
+        T: 'static,
+    {
         let (tx, rx) = bounded(1);
 
         let task = Task {
@@ -81,24 +78,20 @@ impl<T: Send> Task<T> {
         let mut tx = Some(tx);
 
         let coroutine = Coroutine {
-            might_yield: true,
+            might_yield,
             complete: false,
             waker: empty_waker(),
             task_waker: task.waker.clone(),
             poll: Box::new(move |cx| {
-                let future = future.as_mut();
+                if let Some(result) = poll(cx) {
+                    if tx.take().unwrap().send(result).is_err() {
+                        log::trace!("task canceled before it could run, ignoring");
+                    }
 
-                let result = match catch_unwind(AssertUnwindSafe(|| future.poll(cx))) {
-                    Ok(Poll::Pending) => return false,
-                    Ok(Poll::Ready(value)) => Ok(value),
-                    Err(e) => Err(e),
-                };
-
-                if tx.take().unwrap().send(result).is_err() {
-                    log::trace!("task canceled before it could run, ignoring");
+                    true
+                } else {
+                    false
                 }
-
-                true
             }),
         };
 
