@@ -279,11 +279,20 @@ impl ThreadPool {
     {
         let (task, runner) = Task::from_closure(closure);
 
-        if self.try_execute_runner(runner).is_ok() {
-            Some(task)
-        } else {
-            None
-        }
+        self.try_execute_runner(runner).ok().map(|_| task)
+    }
+
+    /// Execute a future on the thread pool.
+    ///
+    /// If the task queue is full, the task is rejected and `None` is returned.
+    pub fn try_execute_future<T, F>(&self, future: F) -> Option<Task<T>>
+    where
+        T: Send + 'static,
+        F: Future<Output = T> + Send + 'static,
+    {
+        let (task, runner) = Task::from_future(future);
+
+        self.try_execute_runner(runner).ok().map(|_| task)
     }
 
     fn execute_runner(&self, runner: Coroutine) {
