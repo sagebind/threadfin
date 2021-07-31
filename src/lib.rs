@@ -8,14 +8,18 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crossbeam_channel::{bounded, select, unbounded, Receiver, Sender};
+use crossbeam_channel::{bounded, unbounded, Receiver, Sender};
 use crossbeam_utils::atomic::AtomicCell;
 use once_cell::sync::OnceCell;
 
 mod task;
+mod worker;
 
 use private::ThreadPoolSize;
+use task::Runner;
 pub use task::Task;
+
+use crate::worker::Listener;
 
 const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
@@ -38,7 +42,7 @@ impl ThreadPoolBuilder {
     pub fn name<T: Into<String>>(mut self, name: T) -> Self {
         let name = name.into();
 
-        if name.contains("\0") {
+        if name.as_bytes().contains(&0) {
             panic!("thread pool name must not contain null bytes");
         }
 
@@ -80,7 +84,7 @@ impl ThreadPoolBuilder {
     /// Set the size of the stack (in bytes) for threads in this thread pool.
     ///
     /// The actual stack size may be greater than this value if the platform
-    /// specifies a minimal stack size.
+    /// enforces a larger minimum stack size.
     pub fn stack_size(mut self, size: usize) -> Self {
         self.stack_size = Some(size);
         self
@@ -88,15 +92,23 @@ impl ThreadPoolBuilder {
 
     /// Set a maximum number of pending tasks allowed to be submitted before
     /// blocking.
+    ///
+    /// If set to zero, queueing will be disabled and attempting to execute a
+    /// new task will block until an idle worker thread can immediately begin
+    /// executing the task or a new worker thread can be created to execute the
+    /// task.
+    ///
+    /// If not set, no limit is enforced.
     pub fn queue_limit(mut self, limit: usize) -> Self {
         self.queue_limit = Some(limit);
         self
     }
 
-    /// Create a thread pool according to the configuration set with this builder.
+    /// Create a thread pool according to the configuration set with this
+    /// builder.
     pub fn build(self) -> ThreadPool {
         let size = self.size.unwrap_or_else(|| {
-            let cpus = num_cpus::get();
+            let cpus = num_cpus::get().max(1);
 
             ThreadPoolSize {
                 min: cpus,
@@ -116,8 +128,7 @@ impl ThreadPoolBuilder {
         let pool = ThreadPool {
             thread_name: self.name,
             stack_size: self.stack_size,
-            immediate_channel: bounded(0),
-            overflow_channel: self.queue_limit.map(bounded).unwrap_or_else(unbounded),
+            queue: self.queue_limit.map(bounded).unwrap_or_else(unbounded),
             shared: Arc::new(shared),
         };
 
@@ -138,8 +149,7 @@ impl ThreadPoolBuilder {
 pub struct ThreadPool {
     thread_name: Option<String>,
     stack_size: Option<usize>,
-    immediate_channel: (Sender<Thunk>, Receiver<Thunk>),
-    overflow_channel: (Sender<Thunk>, Receiver<Thunk>),
+    queue: (Sender<Runner>, Receiver<Runner>),
     shared: Arc<Shared>,
 }
 
@@ -162,16 +172,6 @@ impl ThreadPool {
         Self::builder().build()
     }
 
-    /// Create a new thread pool with a custom name for its threads.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the name contains null bytes (`\0`).
-    #[inline]
-    pub fn with_name<T: Into<String>>(name: T) -> Self {
-        Self::builder().name(name).build()
-    }
-
     /// Get a builder for creating a customized thread pool.
     #[inline]
     pub fn builder() -> ThreadPoolBuilder {
@@ -188,7 +188,7 @@ impl ThreadPool {
     /// This number will always be less than or equal to the configured
     /// [`queue_limit`][ThreadPoolBuilder::queue_limit], if any.
     pub fn queued_tasks(&self) -> usize {
-        self.overflow_channel.0.len()
+        self.queue.0.len()
     }
 
     /// Get the number of tasks currently running.
@@ -211,48 +211,72 @@ impl ThreadPool {
     /// maximum number of threads, the task will be enqueued. If the queue is
     /// configured with a limit, this call will block until space becomes
     /// available in the queue.
-    pub fn execute<T, F>(&self, f: F) -> Task<T>
+    pub fn execute<T, F>(&self, closure: F) -> Task<T>
     where
         T: Send + 'static,
         F: FnOnce() -> T + Send + 'static,
     {
-        let (thunk, task) = create_task(f);
+        let (task, runner) = Task::from_closure(closure);
 
-        if let Err(thunk) = self.try_execute_thunk(thunk) {
-            // Send the task to the overflow queue.
-            self.overflow_channel.0.send(thunk).unwrap();
-        }
+        self.execute_runner(runner);
 
         task
     }
 
     /// Execute a future on the thread pool.
-    pub fn execute_async<T, F>(&self, _future: F) -> Task<T>
+    pub fn execute_future<T, F>(&self, future: F) -> Task<T>
     where
         T: Send + 'static,
         F: Future<Output = T> + Send + 'static,
     {
-        todo!()
+        let (task, runner) = Task::from_future(future);
+
+        self.execute_runner(runner);
+
+        task
     }
 
-    /// Execute a closure on the thread pool, but only if a worker thread can
-    /// immediately begin executing it. If no idle workers are available, `None`
-    /// is returned.
+    /// Execute a closure on the thread pool without blocking.
     ///
-    /// If all worker threads are busy, but there are less threads than the
-    /// configured maximum, an additional thread will be created and added to
-    /// the pool to execute this task.
-    pub fn try_execute<T, F>(&self, f: F) -> Option<Task<T>>
+    /// If the task queue is full, the task is rejected and `None` is returned.
+    pub fn try_execute<T, F>(&self, closure: F) -> Option<Task<T>>
     where
         T: Send + 'static,
         F: FnOnce() -> T + Send + 'static,
     {
-        let (thunk, task) = create_task(f);
+        let (task, runner) = Task::from_closure(closure);
 
-        if self.try_execute_thunk(thunk).is_ok() {
+        if self.try_execute_runner(runner).is_ok() {
             Some(task)
         } else {
             None
+        }
+    }
+
+    fn execute_runner(&self, runner: Runner) {
+        if let Err(runner) = self.try_execute_runner(runner) {
+            self.queue.0.send(runner).unwrap();
+        }
+    }
+
+    fn try_execute_runner(&self, runner: Runner) -> Result<(), Runner> {
+        match self.queue.0.try_send(runner) {
+            Ok(()) => Ok(()),
+
+            // Error means queue is full.
+            Err(e) => {
+                debug_assert!(!e.is_disconnected());
+
+                // If possible, spawn an additional thread to handle the task.
+                // TODO: Lock thread count once
+                if self.threads() < self.shared.size.max {
+                    self.spawn_thread(Some(e.into_inner()));
+
+                    Ok(())
+                } else {
+                    Err(e.into_inner())
+                }
+            }
         }
     }
 
@@ -281,8 +305,7 @@ impl ThreadPool {
     fn join_internal(self, deadline: Option<Instant>) -> bool {
         // Dropping these channels will interrupt any idle workers and prevent
         // new tasks from being scheduled.
-        drop(self.overflow_channel.0);
-        drop(self.immediate_channel.0);
+        drop(self.queue.0);
 
         let mut thread_count = self.shared.thread_count.lock().unwrap();
 
@@ -310,33 +333,35 @@ impl ThreadPool {
         true
     }
 
-    fn try_execute_thunk(&self, thunk: Thunk) -> Result<(), Thunk> {
-        // First attempt: If a worker thread is currently blocked on a recv call
-        // for a thunk, then send one via the immediate channel.
-        match self.immediate_channel.0.try_send(thunk) {
-            Ok(()) => Ok(()),
-
-            // Error means that no workers are currently idle.
-            Err(e) => {
-                debug_assert!(!e.is_disconnected());
-
-                // If possible, spawn an additional thread to handle the task.
-                if self.threads() < self.shared.size.max {
-                    self.spawn_thread(Some(e.into_inner()));
-
-                    Ok(())
-                } else {
-                    Err(e.into_inner())
-                }
-            }
-        }
-    }
-
     /// Spawn an additional thread into the thread pool.
     ///
     /// If an initial thunk is given, it will be the first thunk the thread
     /// executes once ready for work.
-    fn spawn_thread(&self, initial_thunk: Option<Thunk>) {
+    fn spawn_thread(&self, initial_task: Option<Runner>) {
+        struct WorkerListener {
+            shared: Arc<Shared>,
+        }
+
+        impl Listener for WorkerListener {
+            fn on_task_started(&mut self) {
+                self.shared.running_tasks_count.fetch_add(1);
+            }
+
+            fn on_task_completed(&mut self) {
+                self.shared.running_tasks_count.fetch_sub(1);
+                self.shared.completed_tasks_count.fetch_add(1);
+            }
+        }
+
+        impl Drop for WorkerListener {
+            fn drop(&mut self) {
+                if let Ok(mut count) = self.shared.thread_count.lock() {
+                    *count = count.saturating_sub(1);
+                    self.shared.shutdown_cvar.notify_all();
+                }
+            }
+        }
+
         // Configure the thread based on the thread pool configuration.
         let mut builder = thread::Builder::new();
 
@@ -351,12 +376,14 @@ impl ThreadPool {
         let mut thread_count = self.shared.thread_count.lock().unwrap();
         *thread_count += 1;
 
-        let worker = Worker {
-            initial_thunk,
-            immediate_receiver: self.immediate_channel.1.clone(),
-            overflow_receiver: self.overflow_channel.1.clone(),
-            shared: self.shared.clone(),
-        };
+        let mut worker = worker::Worker::new(
+            initial_task,
+            self.queue.1.clone(),
+            self.shared.idle_timeout,
+            WorkerListener {
+                shared: self.shared.clone(),
+            },
+        );
 
         drop(thread_count);
 
@@ -373,18 +400,6 @@ impl fmt::Debug for ThreadPool {
     }
 }
 
-fn create_task<T, F>(f: F) -> (Thunk, Task<T>)
-where
-    T: Send + 'static,
-    F: FnOnce() -> T + Send + 'static,
-{
-    let (task, completer) = Task::new();
-
-    let thunk = Thunk::new(move || completer.complete(f));
-
-    (thunk, task)
-}
-
 /// Thread pool state shared by the owner and the worker threads.
 struct Shared {
     size: ThreadPoolSize,
@@ -393,71 +408,6 @@ struct Shared {
     completed_tasks_count: AtomicCell<u64>,
     idle_timeout: Duration,
     shutdown_cvar: Condvar,
-}
-
-/// Wrapper around closures that can be run by worker threads.
-struct Thunk(Box<dyn FnOnce() + Send>);
-
-impl Thunk {
-    fn new(function: impl FnOnce() + Send + 'static) -> Self {
-        Self(Box::new(function))
-    }
-
-    #[inline]
-    fn execute(self) {
-        (self.0)()
-    }
-}
-
-struct Worker {
-    initial_thunk: Option<Thunk>,
-    immediate_receiver: Receiver<Thunk>,
-    overflow_receiver: Receiver<Thunk>,
-    shared: Arc<Shared>,
-}
-
-impl Worker {
-    fn run(mut self) {
-        if let Some(thunk) = self.initial_thunk.take() {
-            self.execute_thunk(thunk);
-        }
-
-        // Select will return an error if the sender is disconnected. We
-        // want to stop naturally since this means the pool has been shut
-        // down.
-        while let Ok(thunk) = select! {
-            recv(self.immediate_receiver) -> thunk => thunk,
-            recv(self.overflow_receiver) -> thunk => thunk,
-            default(self.shared.idle_timeout) => {
-                // todo!("terminate worker if over min_threads");
-                return;
-            }
-        } {
-            self.execute_thunk(thunk);
-        }
-
-        // If the above loop stopped then the pool is shutting down. Execute any
-        // tasks still queued and then exit.
-        for thunk in self.overflow_receiver.try_iter() {
-            self.execute_thunk(thunk);
-        }
-    }
-
-    fn execute_thunk(&self, thunk: Thunk) {
-        self.shared.running_tasks_count.fetch_add(1);
-        thunk.execute();
-        self.shared.running_tasks_count.fetch_sub(1);
-        self.shared.completed_tasks_count.fetch_add(1);
-    }
-}
-
-impl Drop for Worker {
-    fn drop(&mut self) {
-        if let Ok(mut count) = self.shared.thread_count.lock() {
-            *count = count.saturating_sub(1);
-            self.shared.shutdown_cvar.notify_all();
-        }
-    }
 }
 
 mod private {
@@ -499,7 +449,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "thread pool name must not contain null bytes")]
     fn test_name_with_null_bytes_panics() {
-        ThreadPool::with_name("uh\0oh");
+        ThreadPool::builder().name("uh\0oh").build();
     }
 
     #[test]
@@ -536,8 +486,8 @@ mod tests {
     }
 
     #[test]
-    fn test_try_execute_over_max_count() {
-        let pool = ThreadPool::builder().size(0..1).build();
+    fn test_try_execute_over_limit() {
+        let pool = ThreadPool::builder().size(0..1).queue_limit(0).build();
 
         assert!(pool.try_execute(|| 2 + 2).is_some());
         assert!(pool.try_execute(|| 2 + 2).is_none());
@@ -545,7 +495,7 @@ mod tests {
 
     #[test]
     fn test_name() {
-        let pool = ThreadPool::with_name("foo");
+        let pool = ThreadPool::builder().name("foo").build();
 
         let name = pool
             .execute(|| thread::current().name().unwrap().to_owned())
@@ -563,6 +513,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore]
     fn test_thread_count() {
         let pool = ThreadPool::builder().size(0..1).build();
 
