@@ -29,7 +29,7 @@ pub struct Task<T: Send> {
 
 impl<T: Send> Task<T> {
     /// Create a new task from a closure.
-    pub(crate) fn from_closure<F>(closure: F) -> (Self, Runner)
+    pub(crate) fn from_closure<F>(closure: F) -> (Self, Coroutine)
     where
         F: FnOnce() -> T + Send + 'static,
         T: 'static,
@@ -41,31 +41,31 @@ impl<T: Send> Task<T> {
             waker: Arc::new(AtomicWaker::new()),
         };
 
-        let waker = task.waker.clone();
         let mut closure = Some(closure);
+        let mut tx = Some(tx);
 
-        let runner = Runner {
+        let coroutine = Coroutine {
+            might_yield: false,
+            complete: false,
+            waker: empty_waker(),
+            task_waker: task.waker.clone(),
             poll: Box::new(move |_cx| {
                 let closure = closure.take().unwrap();
                 let result = catch_unwind(AssertUnwindSafe(closure));
 
-                if tx.send(result).is_err() {
-                    waker.wake();
+                if tx.take().unwrap().send(result).is_err() {
                     log::trace!("task canceled before it could run, ignoring");
                 }
 
                 true
             }),
-            waker: empty_waker(),
-            might_yield: false,
-            complete: false,
         };
 
-        (task, runner)
+        (task, coroutine)
     }
 
     /// Create a new asynchronous task from a future.
-    pub(crate) fn from_future<F>(future: F) -> (Self, Runner)
+    pub(crate) fn from_future<F>(future: F) -> (Self, Coroutine)
     where
         F: Future<Output = T> + Send + 'static,
         T: 'static,
@@ -78,9 +78,13 @@ impl<T: Send> Task<T> {
             waker: Arc::new(AtomicWaker::new()),
         };
 
-        let waker = task.waker.clone();
+        let mut tx = Some(tx);
 
-        let runner = Runner {
+        let coroutine = Coroutine {
+            might_yield: true,
+            complete: false,
+            waker: empty_waker(),
+            task_waker: task.waker.clone(),
             poll: Box::new(move |cx| {
                 let future = future.as_mut();
 
@@ -90,19 +94,15 @@ impl<T: Send> Task<T> {
                     Err(e) => Err(e),
                 };
 
-                if tx.send(result).is_err() {
-                    waker.wake();
+                if tx.take().unwrap().send(result).is_err() {
                     log::trace!("task canceled before it could run, ignoring");
                 }
 
                 true
             }),
-            waker: empty_waker(),
-            might_yield: true,
-            complete: false,
         };
 
-        (task, runner)
+        (task, coroutine)
     }
 
     /// Check if the task is done yet.
@@ -169,19 +169,17 @@ impl<T: Send> Future for Task<T> {
 
 /// The worker side of an allocated task, which provides methods for running the
 /// underlying future to completion.
-pub(crate) struct Runner {
-    poll: Box<dyn FnMut(&mut Context) -> bool + Send>,
-    waker: Waker,
-
-    /// Whether this task might yield. This can be used for optimizations if you
-    /// know for certain a waker will never be used.
+pub(crate) struct Coroutine {
     might_yield: bool,
-
-    /// Indicates when the task is complete.
     complete: bool,
+    waker: Waker,
+    task_waker: Arc<AtomicWaker>,
+    poll: Box<dyn FnMut(&mut Context) -> bool + Send>,
 }
 
-impl Runner {
+impl Coroutine {
+    /// Determine whether this task might yield. This can be used for
+    /// optimizations if you know for certain a waker will never be used.
     pub(crate) fn might_yield(&self) -> bool {
         self.might_yield
     }
@@ -191,10 +189,12 @@ impl Runner {
         self.waker = waker;
     }
 
-    /// Poll the underlying future, returning `true` when the future completes.
+    /// Run the coroutine until it yields.
     ///
-    /// If `false` is returned, you should call `poll` again once the waker
-    /// associated with the runner is called.
+    /// If `false` is returned, you should call `run` again once the waker
+    /// associated with the coroutine is called. If `true` is returned, you
+    /// should call [`notify`] to wake any consumers of the task to receive the
+    /// task result.
     ///
     /// Calling this function after the first time it returns `true` is a no-op
     /// and will return `true`.
@@ -206,8 +206,17 @@ impl Runner {
 
         self.complete
     }
+
+    /// Notify any listeners on this task that the task's state has updated.
+    ///
+    /// You must call this yourself when the task completes. It won't be called
+    /// automatically!
+    pub(crate) fn notify(&self) {
+        self.task_waker.wake();
+    }
 }
 
+/// Creates a dummy waker that does nothing.
 fn empty_waker() -> Waker {
     const RAW_WAKER: RawWaker = RawWaker::new(ptr::null(), &VTABLE);
     const VTABLE: RawWakerVTable = RawWakerVTable::new(|_| RAW_WAKER, |_| {}, |_| {}, |_| {});

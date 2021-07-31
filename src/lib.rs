@@ -3,25 +3,27 @@
 use std::{
     fmt,
     future::Future,
-    sync::{Arc, Condvar, Mutex},
+    sync::{
+        atomic::{AtomicU64, AtomicUsize, Ordering},
+        Arc, Condvar, Mutex,
+    },
     thread,
     time::{Duration, Instant},
 };
 
 use crossbeam_channel::{bounded, unbounded, Receiver, Sender};
-use crossbeam_utils::atomic::AtomicCell;
 use once_cell::sync::OnceCell;
 
 mod task;
 mod worker;
 
 use private::ThreadPoolSize;
-use task::Runner;
+use task::Coroutine;
 pub use task::Task;
 
 use crate::worker::Listener;
 
-const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(6);
 
 /// A builder for constructing a customized thread pool.
 #[derive(Debug, Default)]
@@ -129,6 +131,7 @@ impl ThreadPoolBuilder {
             thread_name: self.name,
             stack_size: self.stack_size,
             queue: self.queue_limit.map(bounded).unwrap_or_else(unbounded),
+            immediate_queue: bounded(0),
             shared: Arc::new(shared),
         };
 
@@ -149,7 +152,8 @@ impl ThreadPoolBuilder {
 pub struct ThreadPool {
     thread_name: Option<String>,
     stack_size: Option<usize>,
-    queue: (Sender<Runner>, Receiver<Runner>),
+    queue: (Sender<Coroutine>, Receiver<Coroutine>),
+    immediate_queue: (Sender<Coroutine>, Receiver<Coroutine>),
     shared: Arc<Shared>,
 }
 
@@ -193,12 +197,12 @@ impl ThreadPool {
 
     /// Get the number of tasks currently running.
     pub fn running_tasks(&self) -> usize {
-        self.shared.running_tasks_count.load()
+        self.shared.running_tasks_count.load(Ordering::SeqCst)
     }
 
     /// Get the number of tasks completed by this pool since it was created.
     pub fn completed_tasks(&self) -> u64 {
-        self.shared.completed_tasks_count.load()
+        self.shared.completed_tasks_count.load(Ordering::SeqCst)
     }
 
     /// Submit a task to be executed.
@@ -253,14 +257,14 @@ impl ThreadPool {
         }
     }
 
-    fn execute_runner(&self, runner: Runner) {
+    fn execute_runner(&self, runner: Coroutine) {
         if let Err(runner) = self.try_execute_runner(runner) {
             self.queue.0.send(runner).unwrap();
         }
     }
 
-    fn try_execute_runner(&self, runner: Runner) -> Result<(), Runner> {
-        match self.queue.0.try_send(runner) {
+    fn try_execute_runner(&self, runner: Coroutine) -> Result<(), Coroutine> {
+        match self.immediate_queue.0.try_send(runner) {
             Ok(()) => Ok(()),
 
             // Error means queue is full.
@@ -337,19 +341,25 @@ impl ThreadPool {
     ///
     /// If an initial thunk is given, it will be the first thunk the thread
     /// executes once ready for work.
-    fn spawn_thread(&self, initial_task: Option<Runner>) {
+    fn spawn_thread(&self, initial_task: Option<Coroutine>) {
         struct WorkerListener {
             shared: Arc<Shared>,
         }
 
         impl Listener for WorkerListener {
             fn on_task_started(&mut self) {
-                self.shared.running_tasks_count.fetch_add(1);
+                self.shared
+                    .running_tasks_count
+                    .fetch_add(1, Ordering::SeqCst);
             }
 
             fn on_task_completed(&mut self) {
-                self.shared.running_tasks_count.fetch_sub(1);
-                self.shared.completed_tasks_count.fetch_add(1);
+                self.shared
+                    .running_tasks_count
+                    .fetch_sub(1, Ordering::SeqCst);
+                self.shared
+                    .completed_tasks_count
+                    .fetch_add(1, Ordering::SeqCst);
             }
         }
 
@@ -379,6 +389,7 @@ impl ThreadPool {
         let mut worker = worker::Worker::new(
             initial_task,
             self.queue.1.clone(),
+            self.immediate_queue.1.clone(),
             self.shared.idle_timeout,
             WorkerListener {
                 shared: self.shared.clone(),
@@ -404,8 +415,8 @@ impl fmt::Debug for ThreadPool {
 struct Shared {
     size: ThreadPoolSize,
     thread_count: Mutex<usize>,
-    running_tasks_count: AtomicCell<usize>,
-    completed_tasks_count: AtomicCell<u64>,
+    running_tasks_count: AtomicUsize,
+    completed_tasks_count: AtomicU64,
     idle_timeout: Duration,
     shutdown_cvar: Condvar,
 }
@@ -513,7 +524,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
     fn test_thread_count() {
         let pool = ThreadPool::builder().size(0..1).build();
 
