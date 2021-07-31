@@ -11,6 +11,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use core_affinity::CoreId;
 use crossbeam_channel::{bounded, unbounded, Receiver, Sender};
 use once_cell::sync::OnceCell;
 
@@ -69,6 +70,9 @@ impl ThreadPoolBuilder {
     /// the upper bound will be a maximum pool size the pool is allowed to burst
     /// up to when the core threads are busy.
     ///
+    /// If not set, a reasonable size will be selected based on the number of
+    /// CPU cores on the current system.
+    ///
     /// # Examples
     ///
     /// ```
@@ -119,8 +123,14 @@ impl ThreadPoolBuilder {
     /// Create a thread pool according to the configuration set with this
     /// builder.
     pub fn build(self) -> ThreadPool {
+        let core_ids = core_affinity::get_core_ids();
+
         let size = self.size.unwrap_or_else(|| {
-            let cpus = num_cpus::get().max(1);
+            let cpus = core_ids
+                .as_ref()
+                .filter(|v| !v.is_empty())
+                .map(Vec::len)
+                .unwrap_or(1);
 
             ThreadPoolSize {
                 min: cpus,
@@ -133,6 +143,7 @@ impl ThreadPoolBuilder {
             thread_count: Default::default(),
             running_tasks_count: Default::default(),
             completed_tasks_count: Default::default(),
+            panicked_tasks_count: Default::default(),
             idle_timeout: self.idle_timeout,
             shutdown_cvar: Condvar::new(),
         };
@@ -142,11 +153,13 @@ impl ThreadPoolBuilder {
             stack_size: self.stack_size,
             queue: self.queue_limit.map(bounded).unwrap_or_else(unbounded),
             immediate_queue: bounded(0),
+            core_ids,
             shared: Arc::new(shared),
         };
 
         for _ in 0..size.min {
-            pool.spawn_thread(None);
+            let result = pool.spawn_thread(None);
+            assert!(result.is_ok());
         }
 
         pool
@@ -164,6 +177,7 @@ pub struct ThreadPool {
     stack_size: Option<usize>,
     queue: (Sender<Coroutine>, Receiver<Coroutine>),
     immediate_queue: (Sender<Coroutine>, Receiver<Coroutine>),
+    core_ids: Option<Vec<CoreId>>,
     shared: Arc<Shared>,
 }
 
@@ -177,7 +191,7 @@ impl ThreadPool {
     pub fn common() -> &'static Self {
         static COMMON: OnceCell<ThreadPool> = OnceCell::new();
 
-        COMMON.get_or_init(|| Self::default())
+        COMMON.get_or_init(Self::default)
     }
 
     /// Create a new thread pool with the default configuration.
@@ -210,9 +224,14 @@ impl ThreadPool {
         self.shared.running_tasks_count.load(Ordering::SeqCst)
     }
 
-    /// Get the number of tasks completed by this pool since it was created.
+    /// Get the number of tasks completed (successfully or otherwise) by this pool since it was created.
     pub fn completed_tasks(&self) -> u64 {
         self.shared.completed_tasks_count.load(Ordering::SeqCst)
+    }
+
+    /// Get the number of tasks that have panicked since the pool was created.
+    pub fn panicked_tasks(&self) -> u64 {
+        self.shared.panicked_tasks_count.load(Ordering::SeqCst)
     }
 
     /// Submit a task to be executed.
@@ -282,13 +301,9 @@ impl ThreadPool {
                 debug_assert!(!e.is_disconnected());
 
                 // If possible, spawn an additional thread to handle the task.
-                // TODO: Lock thread count once
-                if self.threads() < self.shared.size.max {
-                    self.spawn_thread(Some(e.into_inner()));
-
-                    Ok(())
-                } else {
-                    Err(e.into_inner())
+                match self.spawn_thread(Some(e.into_inner())) {
+                    Ok(()) => Ok(()),
+                    Err(e) => Err(e.unwrap()),
                 }
             }
         }
@@ -347,11 +362,11 @@ impl ThreadPool {
         true
     }
 
-    /// Spawn an additional thread into the thread pool.
+    /// Spawn an additional thread into the thread pool, if possible.
     ///
     /// If an initial thunk is given, it will be the first thunk the thread
     /// executes once ready for work.
-    fn spawn_thread(&self, initial_task: Option<Coroutine>) {
+    fn spawn_thread(&self, initial_task: Option<Coroutine>) -> Result<(), Option<Coroutine>> {
         struct WorkerListener {
             shared: Arc<Shared>,
         }
@@ -363,13 +378,19 @@ impl ThreadPool {
                     .fetch_add(1, Ordering::SeqCst);
             }
 
-            fn on_task_completed(&mut self) {
+            fn on_task_completed(&mut self, panicked: bool) {
                 self.shared
                     .running_tasks_count
                     .fetch_sub(1, Ordering::SeqCst);
                 self.shared
                     .completed_tasks_count
                     .fetch_add(1, Ordering::SeqCst);
+
+                if panicked {
+                    self.shared
+                        .panicked_tasks_count
+                        .fetch_add(1, Ordering::SeqCst);
+                }
             }
         }
 
@@ -380,6 +401,15 @@ impl ThreadPool {
                     self.shared.shutdown_cvar.notify_all();
                 }
             }
+        }
+
+        // Lock the thread count to prevent race conditions when determining
+        // whether new threads can be created.
+        let mut thread_count = self.shared.thread_count.lock().unwrap();
+
+        // We've reached the configured limit for threads, do nothing.
+        if *thread_count >= self.shared.size.max {
+            return Err(initial_task);
         }
 
         // Configure the thread based on the thread pool configuration.
@@ -393,7 +423,21 @@ impl ThreadPool {
             builder = builder.stack_size(size);
         }
 
-        let mut thread_count = self.shared.thread_count.lock().unwrap();
+        let mut core_id = None;
+
+        // Select the core to pin this worker to in a deterministic round-robin
+        // fashion. For example, if the system has 2 CPU cores, threads 0, 2, 4,
+        // etc will be pinned to core 0, and threads 1, 3, 5, etc will be pinned
+        // to core 1.
+        //
+        // We only do this if the min number of threads is at least as large as
+        // the number of cores.
+        if let Some(core_ids) = self.core_ids.as_ref() {
+            if !core_ids.is_empty() && self.shared.size.min >= core_ids.len() {
+                core_id = Some(core_ids[*thread_count % core_ids.len()]);
+            }
+        }
+
         *thread_count += 1;
 
         let mut worker = worker::Worker::new(
@@ -406,9 +450,21 @@ impl ThreadPool {
             },
         );
 
+        // We can now safely unlock the thread count since the worker struct
+        // will decrement the count again if it is dropped.
         drop(thread_count);
 
-        builder.spawn(move || worker.run()).unwrap();
+        builder
+            .spawn(move || {
+                if let Some(core_id) = core_id {
+                    core_affinity::set_for_current(core_id);
+                }
+
+                worker.run();
+            })
+            .unwrap();
+
+        Ok(())
     }
 }
 
@@ -428,6 +484,7 @@ struct Shared {
     thread_count: Mutex<usize>,
     running_tasks_count: AtomicUsize,
     completed_tasks_count: AtomicU64,
+    panicked_tasks_count: AtomicU64,
     idle_timeout: Duration,
     shutdown_cvar: Condvar,
 }
@@ -466,6 +523,8 @@ mod private {
 
 #[cfg(test)]
 mod tests {
+    use std::panic::catch_unwind;
+
     use super::*;
 
     #[test]
@@ -541,6 +600,19 @@ mod tests {
         let pool = ThreadPool::default();
 
         pool.execute(|| panic!("oh no!")).get();
+    }
+
+    #[test]
+    fn test_panic_count() {
+        let pool = ThreadPool::default();
+        assert_eq!(pool.panicked_tasks(), 0);
+
+        let task = pool.execute(|| panic!("oh no!"));
+        let _ = catch_unwind(move || {
+            task.get();
+        });
+
+        assert_eq!(pool.panicked_tasks(), 1);
     }
 
     #[test]

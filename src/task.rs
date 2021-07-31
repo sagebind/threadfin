@@ -24,7 +24,7 @@ use crossbeam_channel::{bounded, Receiver, RecvTimeoutError, TryRecvError};
 /// have no effect.
 pub struct Task<T: Send> {
     receiver: Receiver<thread::Result<T>>,
-    waker: Arc<AtomicWaker>,
+    waker: AssertUnwindSafe<Arc<AtomicWaker>>,
 }
 
 impl<T: Send> Task<T> {
@@ -72,25 +72,27 @@ impl<T: Send> Task<T> {
 
         let task = Task {
             receiver: rx,
-            waker: Arc::new(AtomicWaker::new()),
+            waker: AssertUnwindSafe(Arc::new(AtomicWaker::new())),
         };
 
         let mut tx = Some(tx);
 
         let coroutine = Coroutine {
             might_yield,
-            complete: false,
+            last_result: RunResult::Yield,
             waker: empty_waker(),
             task_waker: task.waker.clone(),
             poll: Box::new(move |cx| {
                 if let Some(result) = poll(cx) {
+                    let panicked = result.is_err();
+
                     if tx.take().unwrap().send(result).is_err() {
-                        log::trace!("task canceled before it could run, ignoring");
+                        // task canceled before it could run, do nothing
                     }
 
-                    true
+                    RunResult::Complete { panicked }
                 } else {
-                    false
+                    RunResult::Yield
                 }
             }),
         };
@@ -164,10 +166,10 @@ impl<T: Send> Future for Task<T> {
 /// underlying future to completion.
 pub(crate) struct Coroutine {
     might_yield: bool,
-    complete: bool,
+    last_result: RunResult,
     waker: Waker,
     task_waker: Arc<AtomicWaker>,
-    poll: Box<dyn FnMut(&mut Context) -> bool + Send>,
+    poll: Box<dyn FnMut(&mut Context) -> RunResult + Send>,
 }
 
 impl Coroutine {
@@ -184,20 +186,15 @@ impl Coroutine {
 
     /// Run the coroutine until it yields.
     ///
-    /// If `false` is returned, you should call `run` again once the waker
-    /// associated with the coroutine is called. If `true` is returned, you
-    /// should call [`notify`] to wake any consumers of the task to receive the
-    /// task result.
-    ///
-    /// Calling this function after the first time it returns `true` is a no-op
-    /// and will return `true`.
-    pub(crate) fn run(&mut self) -> bool {
-        if !self.complete {
+    /// Calling this function after the first time it returns `Complete` is a
+    /// no-op and will continue to return `Complete`.
+    pub(crate) fn run(&mut self) -> RunResult {
+        if self.last_result == RunResult::Yield {
             let mut cx = Context::from_waker(&self.waker);
-            self.complete = (self.poll)(&mut cx);
+            self.last_result = (self.poll)(&mut cx);
         }
 
-        self.complete
+        self.last_result
     }
 
     /// Notify any listeners on this task that the task's state has updated.
@@ -207,6 +204,20 @@ impl Coroutine {
     pub(crate) fn notify(&self) {
         self.task_waker.wake();
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RunResult {
+    /// The coroutine has yielded. You should call `run` on the coroutine again
+    /// once the waker associated with the coroutine is called.
+    Yield,
+
+    /// The coroutine and its associated task has completed. You should call
+    /// [`Coroutine::notify`] to wake any consumers of the task to receive the
+    /// task result.
+    Complete {
+        panicked: bool,
+    },
 }
 
 /// Creates a dummy waker that does nothing.

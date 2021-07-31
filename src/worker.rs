@@ -3,13 +3,13 @@ use std::{sync::Arc, task::Wake, time::Duration};
 use crossbeam_channel::{select, unbounded, Receiver, Sender};
 use slab::Slab;
 
-use crate::task::Coroutine;
+use crate::task::{Coroutine, RunResult};
 
 /// A type which receives notifications from a worker.
 pub(crate) trait Listener {
     fn on_task_started(&mut self) {}
 
-    fn on_task_completed(&mut self) {}
+    fn on_task_completed(&mut self, _panicked: bool) {}
 }
 
 /// A worker thread which belongs to a thread pool and executes tasks.
@@ -129,8 +129,8 @@ impl<L: Listener> Worker<L> {
 
         self.listener.on_task_started();
 
-        if runner.run() {
-            self.listener.on_task_completed();
+        if let RunResult::Complete { panicked } = runner.run() {
+            self.listener.on_task_completed(panicked);
             runner.notify();
         } else {
             // This should never happen if the task promised not to yield!
@@ -151,8 +151,8 @@ impl<L: Listener> Worker<L> {
 
     fn run_by_id(&mut self, id: usize) {
         if let Some(runner) = self.pending_tasks.get_mut(id) {
-            if runner.run() {
-                self.listener.on_task_completed();
+            if let RunResult::Complete { panicked } = runner.run() {
+                self.listener.on_task_completed(panicked);
                 runner.notify();
 
                 // Task is complete, we can de-allocate it.
