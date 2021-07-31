@@ -9,3 +9,6 @@ core_affinity = "0.5"
 crossbeam-channel = "0.5"
 once_cell = "1.8"
 slab = "0.4"
+
+[dev-dependencies]
+futures-timer = "3"

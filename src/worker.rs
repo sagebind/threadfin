@@ -1,6 +1,6 @@
 use std::{sync::Arc, task::Wake, time::Duration};
 
-use crossbeam_channel::{select, unbounded, Receiver, Sender};
+use crossbeam_channel::{unbounded, Receiver, Select, Sender};
 use slab::Slab;
 
 use crate::task::{Coroutine, RunResult};
@@ -10,6 +10,10 @@ pub(crate) trait Listener {
     fn on_task_started(&mut self) {}
 
     fn on_task_completed(&mut self, _panicked: bool) {}
+
+    fn on_idle(&mut self) -> bool {
+        true
+    }
 }
 
 /// A worker thread which belongs to a thread pool and executes tasks.
@@ -33,11 +37,17 @@ pub(crate) struct Worker<L: Listener> {
     /// Channel used to receive notifications from wakers for pending tasks.
     wake_notifications: (Sender<usize>, Receiver<usize>),
 
+    /// Set to true when the worker is running and wants to consume more work.
+    active: bool,
+
     /// Receiver of various worker events.
     listener: L,
 }
 
 impl<L: Listener> Worker<L> {
+    const CONCURRENCY_LIMIT: usize = 16;
+
+    /// Create a new worker.
     pub(crate) fn new(
         initial_task: Option<Coroutine>,
         queue: Receiver<Coroutine>,
@@ -52,60 +62,90 @@ impl<L: Listener> Worker<L> {
             queue,
             immediate_queue,
             wake_notifications: unbounded(),
+            active: false,
             listener,
         }
     }
 
-    pub(crate) fn run(&mut self) {
-        if let Some(runner) = self.initial_task.take() {
-            self.run_now_or_reschedule(runner);
+    /// Run the worker on the current thread until the work queue is closed.
+    pub(crate) fn run(mut self) {
+        self.active = true;
+
+        if let Some(coroutine) = self.initial_task.take() {
+            self.run_now_or_reschedule(coroutine);
         }
 
-        // Main worker loop
-        loop {
-            select! {
-                recv(self.queue) -> runner => {
-                    if let Ok(runner) = runner {
-                        self.run_now_or_reschedule(runner);
-                    } else {
-                        // todo!("pool closed, shut down worker");
-                        break;
+        // Main worker loop, keep running until the pool shuts down and pending
+        // tasks complete.
+        while self.active || !self.pending_tasks.is_empty() {
+            match self.poll_work() {
+                PollResult::Work(coroutine) => self.run_now_or_reschedule(coroutine),
+                PollResult::Wake(id) => self.run_pending_by_id(id),
+                PollResult::ShutDown => self.active = false,
+                PollResult::Timeout => {
+                    // If this worker doesn't have an pending tasks, then we can
+                    // potentially shut down the worker due to inactivity.
+                    if self.pending_tasks.is_empty() {
+                        // If the listener tells us we ought to shut down, then
+                        // do so.
+                        if self.listener.on_idle() {
+                            self.active = false;
+                        }
                     }
-                }
-                recv(self.immediate_queue) -> runner => {
-                    if let Ok(runner) = runner {
-                        self.run_now_or_reschedule(runner);
-                    }
-                }
-                recv(self.wake_notifications.1) -> id => {
-                    let id = id.expect("wake channel can't be dropped");
-                    self.run_by_id(id);
-                }
-                default(self.idle_timeout) => {
-                    // todo!("terminate worker if over min_threads");
-                    return;
                 }
             }
         }
+    }
 
-        // Worker has been instructed to stop, but we want to finish running any
-        // pending tasks we still may have.
-        while !self.pending_tasks.is_empty() {
-            let id = self
-                .wake_notifications
-                .1
-                .recv()
-                .expect("wake channel can't be dropped");
-            self.run_by_id(id);
+    /// Poll for the next work item the worker should work on.
+    fn poll_work(&mut self) -> PollResult {
+        let mut queue_id = None;
+        let mut immediate_queue_id = None;
+        let mut wake_id = None;
+        let mut select = Select::new();
+
+        // As long as we haven't reached our concurrency limit, poll for
+        // additional work.
+        if self.active && self.pending_tasks.len() < Self::CONCURRENCY_LIMIT {
+            queue_id = Some(select.recv(&self.queue));
+            immediate_queue_id = Some(select.recv(&self.immediate_queue));
+        }
+
+        // If we have pending tasks, poll for waker notifications as well.
+        if !self.pending_tasks.is_empty() {
+            wake_id = Some(select.recv(&self.wake_notifications.1));
+        }
+
+        match select.select_timeout(self.idle_timeout) {
+            Ok(op) => {
+                if Some(op.index()) == queue_id {
+                    if let Ok(coroutine) = op.recv(&self.queue) {
+                        PollResult::Work(coroutine)
+                    } else {
+                        PollResult::ShutDown
+                    }
+                } else if Some(op.index()) == immediate_queue_id {
+                    if let Ok(coroutine) = op.recv(&self.immediate_queue) {
+                        PollResult::Work(coroutine)
+                    } else {
+                        PollResult::ShutDown
+                    }
+                } else if Some(op.index()) == wake_id {
+                    PollResult::Wake(op.recv(&self.wake_notifications.1).unwrap())
+                } else {
+                    unreachable!()
+                }
+            }
+            Err(_) => PollResult::Timeout,
         }
     }
 
-    fn run_now_or_reschedule(&mut self, mut runner: Coroutine) {
+    fn run_now_or_reschedule(&mut self, mut coroutine: Coroutine) {
         let vacant_entry = self.pending_tasks.vacant_entry();
 
         // If it is possible for this task to yield, we need to prepare a new
         // waker to receive notifications with.
-        if runner.might_yield() {
+        if coroutine.might_yield() {
             struct IdWaker(usize, Sender<usize>);
 
             impl Wake for IdWaker {
@@ -118,7 +158,7 @@ impl<L: Listener> Worker<L> {
                 }
             }
 
-            runner.set_waker(
+            coroutine.set_waker(
                 Arc::new(IdWaker(
                     vacant_entry.key(),
                     self.wake_notifications.0.clone(),
@@ -129,12 +169,12 @@ impl<L: Listener> Worker<L> {
 
         self.listener.on_task_started();
 
-        if let RunResult::Complete { panicked } = runner.run() {
+        if let RunResult::Complete { panicked } = coroutine.run() {
             self.listener.on_task_completed(panicked);
-            runner.notify();
+            coroutine.notify();
         } else {
             // This should never happen if the task promised not to yield!
-            debug_assert!(runner.might_yield());
+            debug_assert!(coroutine.might_yield());
 
             // Task yielded, so we'll need to reschedule the task to be polled
             // again when its waker is called. We do this by storing the future
@@ -145,19 +185,33 @@ impl<L: Listener> Worker<L> {
             // back through the queue is that the future gets executed (almost)
             // immediately once it wakes instead of being put behind a queue of
             // _new_ tasks.
-            vacant_entry.insert(runner);
+            vacant_entry.insert(coroutine);
         }
     }
 
-    fn run_by_id(&mut self, id: usize) {
-        if let Some(runner) = self.pending_tasks.get_mut(id) {
-            if let RunResult::Complete { panicked } = runner.run() {
+    fn run_pending_by_id(&mut self, id: usize) {
+        if let Some(coroutine) = self.pending_tasks.get_mut(id) {
+            if let RunResult::Complete { panicked } = coroutine.run() {
                 self.listener.on_task_completed(panicked);
-                runner.notify();
+                coroutine.notify();
 
                 // Task is complete, we can de-allocate it.
                 self.pending_tasks.remove(id);
             }
         }
     }
+}
+
+enum PollResult {
+    /// New work has arrived for this worker.
+    Work(Coroutine),
+
+    /// An existing pending task has woken.
+    Wake(usize),
+
+    /// No activity occurred within the time limit.
+    Timeout,
+
+    /// The thread pool has been shut down.
+    ShutDown,
 }

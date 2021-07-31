@@ -120,6 +120,11 @@ impl ThreadPoolBuilder {
         self
     }
 
+    pub fn idle_timeout(mut self, timeout: Duration) -> Self {
+        self.idle_timeout = timeout;
+        self
+    }
+
     /// Create a thread pool according to the configuration set with this
     /// builder.
     pub fn build(self) -> ThreadPool {
@@ -302,20 +307,24 @@ impl ThreadPool {
     }
 
     fn try_execute_runner(&self, runner: Coroutine) -> Result<(), Coroutine> {
-        match self.immediate_queue.0.try_send(runner) {
-            Ok(()) => Ok(()),
+        // First, try to pass the coroutine to an idle worker currently polling
+        // for work. This is the most favorable scenario for a task to begin
+        // processing.
+        if let Err(e) = self.immediate_queue.0.try_send(runner) {
+            // Error means no workers are currently polling the queue.
+            debug_assert!(!e.is_disconnected());
 
-            // Error means queue is full.
-            Err(e) => {
-                debug_assert!(!e.is_disconnected());
-
-                // If possible, spawn an additional thread to handle the task.
-                match self.spawn_thread(Some(e.into_inner())) {
-                    Ok(()) => Ok(()),
-                    Err(e) => Err(e.unwrap()),
+            // If possible, spawn an additional thread to handle the task.
+            if let Err(e) = self.spawn_thread(Some(e.into_inner())) {
+                // Finally as a last resort, enqueue the task into the queue,
+                // but only if it isn't full.
+                if let Err(e) = self.queue.0.try_send(e.unwrap()) {
+                    return Err(e.into_inner());
                 }
             }
         }
+
+        Ok(())
     }
 
     /// Shut down this thread pool and block until all existing tasks have
@@ -401,6 +410,12 @@ impl ThreadPool {
                         .fetch_add(1, Ordering::SeqCst);
                 }
             }
+
+            fn on_idle(&mut self) -> bool {
+                // Check if the worker should shut down by seeing if we are over
+                // the minimum worker count.
+                *self.shared.thread_count.lock().unwrap() > self.shared.size.min
+            }
         }
 
         impl Drop for WorkerListener {
@@ -449,7 +464,7 @@ impl ThreadPool {
 
         *thread_count += 1;
 
-        let mut worker = worker::Worker::new(
+        let worker = worker::Worker::new(
             initial_task,
             self.queue.1.clone(),
             self.immediate_queue.1.clone(),
@@ -527,148 +542,5 @@ mod private {
                 max: range.end,
             }
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use std::panic::catch_unwind;
-
-    use super::*;
-
-    #[test]
-    #[should_panic(expected = "thread pool name must not contain null bytes")]
-    fn test_name_with_null_bytes_panics() {
-        ThreadPool::builder().name("uh\0oh").build();
-    }
-
-    #[test]
-    #[should_panic(expected = "thread pool minimum size cannot be larger than maximum size")]
-    fn test_invalid_size_panics() {
-        ThreadPool::builder().size(2..1);
-    }
-
-    #[test]
-    fn test_execute() {
-        let pool = ThreadPool::default();
-
-        let result = pool.execute(|| 2 + 2).get();
-
-        assert_eq!(result, 4);
-    }
-
-    #[test]
-    fn test_execute_async() {
-        let pool = ThreadPool::default();
-
-        let result = pool.execute_future(async { 2 + 2 }).get();
-
-        assert_eq!(result, 4);
-    }
-
-    #[test]
-    fn test_try_execute_under_core_count() {
-        let pool = ThreadPool::builder().size(1).build();
-
-        // Give some time for thread to start...
-        thread::sleep(Duration::from_millis(50));
-        assert_eq!(pool.threads(), 1);
-
-        assert!(pool.try_execute(|| 2 + 2).is_some());
-    }
-
-    #[test]
-    fn test_try_execute_over_core_count() {
-        let pool = ThreadPool::builder().size(0..1).build();
-
-        assert!(pool.try_execute(|| 2 + 2).is_some());
-    }
-
-    #[test]
-    fn test_try_execute_over_limit() {
-        let pool = ThreadPool::builder().size(0..1).queue_limit(0).build();
-
-        assert!(pool.try_execute(|| 2 + 2).is_some());
-        assert!(pool.try_execute(|| 2 + 2).is_none());
-    }
-
-    #[test]
-    fn test_name() {
-        let pool = ThreadPool::builder().name("foo").build();
-
-        let name = pool
-            .execute(|| thread::current().name().unwrap().to_owned())
-            .get();
-
-        assert_eq!(name, "foo");
-    }
-
-    #[test]
-    #[should_panic(expected = "oh no!")]
-    fn test_panic_propagates_to_task() {
-        let pool = ThreadPool::default();
-
-        pool.execute(|| panic!("oh no!")).get();
-    }
-
-    #[test]
-    fn test_panic_count() {
-        let pool = ThreadPool::default();
-        assert_eq!(pool.panicked_tasks(), 0);
-
-        let task = pool.execute(|| panic!("oh no!"));
-        let _ = catch_unwind(move || {
-            task.get();
-        });
-
-        assert_eq!(pool.panicked_tasks(), 1);
-    }
-
-    #[test]
-    fn test_thread_count() {
-        let pool = ThreadPool::builder().size(0..1).build();
-
-        assert_eq!(pool.threads(), 0);
-
-        pool.execute(|| 2 + 2).get();
-        assert_eq!(pool.threads(), 1);
-
-        let pool_with_starting_threads = ThreadPool::builder().size(1).build();
-
-        // Give some time for thread to start...
-        thread::sleep(Duration::from_millis(50));
-        assert_eq!(pool_with_starting_threads.threads(), 1);
-    }
-
-    #[test]
-    fn test_tasks_completed() {
-        let pool = ThreadPool::default();
-        assert_eq!(pool.completed_tasks(), 0);
-
-        pool.execute(|| 2 + 2).get();
-        assert_eq!(pool.completed_tasks(), 1);
-
-        pool.execute(|| 2 + 2).get();
-        assert_eq!(pool.completed_tasks(), 2);
-    }
-
-    #[test]
-    fn test_join() {
-        // Just a dumb test to make sure join doesn't do anything strange.
-        ThreadPool::default().join();
-    }
-
-    #[test]
-    fn test_join_timeout_expiring() {
-        let pool = ThreadPool::builder().size(1).build();
-        assert_eq!(pool.threads(), 1);
-
-        // Schedule a slow task on the only thread. We have to keep the task
-        // around, because dropping it could cancel the task.
-        let _task = pool.execute(|| thread::sleep(Duration::from_millis(50)));
-
-        // Joining should time out since there's one task still running longer
-        // than our join timeout.
-        assert!(!pool.join_timeout(Duration::from_millis(10)));
     }
 }
