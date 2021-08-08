@@ -1,7 +1,7 @@
 use std::{panic::catch_unwind, thread, time::Duration};
 
 use futures_timer::Delay;
-use squad::ThreadPool;
+use skipper::ThreadPool;
 
 fn single_thread() -> ThreadPool {
     ThreadPool::builder().size(0..1).build()
@@ -23,18 +23,29 @@ fn invalid_size_panics() {
 fn execute() {
     let pool = single_thread();
 
-    let result = pool.execute(|| 2 + 2).get();
+    let result = pool.execute(|| 2 + 2).join();
 
     assert_eq!(result, 4);
 }
 
 #[test]
-fn execute_async() {
+fn execute_future() {
     let pool = single_thread();
 
-    let result = pool.execute_future(async { 2 + 2 }).get();
+    let result = pool.execute_future(async { 2 + 2 }).join();
 
     assert_eq!(result, 4);
+}
+
+#[test]
+fn task_join_timeout() {
+    let pool = single_thread();
+
+    let result = pool
+        .execute(|| thread::sleep(Duration::from_millis(50)))
+        .join_timeout(Duration::from_millis(10));
+
+    assert!(result.is_err());
 }
 
 #[test]
@@ -43,7 +54,9 @@ fn futures_that_yield_are_run_concurrently() {
 
     assert_eq!(pool.running_tasks(), 0);
 
-    let first = pool.try_execute_future(Delay::new(Duration::from_millis(100))).unwrap();
+    let first = pool
+        .try_execute_future(Delay::new(Duration::from_millis(100)))
+        .unwrap();
 
     // Even though there's only one worker thread, it should become idle quickly
     // and start polling for more work, because a delay future yields
@@ -52,7 +65,9 @@ fn futures_that_yield_are_run_concurrently() {
 
     assert_eq!(pool.running_tasks(), 1);
 
-    let second = pool.try_execute_future(Delay::new(Duration::from_millis(100))).unwrap();
+    let second = pool
+        .try_execute_future(Delay::new(Duration::from_millis(100)))
+        .unwrap();
 
     thread::sleep(Duration::from_millis(10));
 
@@ -60,8 +75,8 @@ fn futures_that_yield_are_run_concurrently() {
     assert_eq!(pool.running_tasks(), 2);
     assert_eq!(pool.threads(), 1);
 
-    first.get();
-    second.get();
+    first.join();
+    second.join();
 
     // Both tasks completed.
     assert_eq!(pool.completed_tasks(), 2);
@@ -99,7 +114,7 @@ fn name() {
 
     let name = pool
         .execute(|| thread::current().name().unwrap().to_owned())
-        .get();
+        .join();
 
     assert_eq!(name, "foo");
 }
@@ -109,7 +124,7 @@ fn name() {
 fn panic_propagates_to_task() {
     let pool = single_thread();
 
-    pool.execute(|| panic!("oh no!")).get();
+    pool.execute(|| panic!("oh no!")).join();
 }
 
 #[test]
@@ -119,7 +134,7 @@ fn panic_count() {
 
     let task = pool.execute(|| panic!("oh no!"));
     let _ = catch_unwind(move || {
-        task.get();
+        task.join();
     });
 
     assert_eq!(pool.panicked_tasks(), 1);
@@ -131,7 +146,7 @@ fn thread_count() {
 
     assert_eq!(pool.threads(), 0);
 
-    pool.execute(|| 2 + 2).get();
+    pool.execute(|| 2 + 2).join();
     assert_eq!(pool.threads(), 1);
 
     let pool_with_starting_threads = ThreadPool::builder().size(1).build();
@@ -149,11 +164,15 @@ fn idle_shutdown() {
         .build();
     assert_eq!(pool.threads(), 0, "pool starts out empty");
 
-    pool.execute(|| 2 + 2).get();
+    pool.execute(|| 2 + 2).join();
     assert_eq!(pool.threads(), 1, "one thread was added");
 
     thread::sleep(Duration::from_millis(200));
-    assert_eq!(pool.threads(), 0, "thread became idle and terminated after timeout");
+    assert_eq!(
+        pool.threads(),
+        0,
+        "thread became idle and terminated after timeout"
+    );
 }
 
 #[test]
@@ -161,10 +180,10 @@ fn tasks_completed() {
     let pool = ThreadPool::default();
     assert_eq!(pool.completed_tasks(), 0);
 
-    pool.execute(|| 2 + 2).get();
+    pool.execute(|| 2 + 2).join();
     assert_eq!(pool.completed_tasks(), 1);
 
-    pool.execute(|| 2 + 2).get();
+    pool.execute(|| 2 + 2).join();
     assert_eq!(pool.completed_tasks(), 2);
 }
 
