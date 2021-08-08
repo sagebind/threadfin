@@ -1,13 +1,7 @@
-use std::{
-    future::Future,
-    panic::{catch_unwind, resume_unwind, AssertUnwindSafe},
-    pin::Pin,
-    ptr,
-    sync::Arc,
-    task::{Context, Poll, RawWaker, RawWakerVTable, Waker},
-    thread,
-    time::Duration,
-};
+//! Implementation of a task, as well as underlying primitives used to drive
+//! their execution.
+
+use std::{future::Future, panic::{catch_unwind, resume_unwind, AssertUnwindSafe}, pin::Pin, ptr, sync::Arc, task::{Context, Poll, RawWaker, RawWakerVTable, Waker}, thread, time::{Duration, Instant}};
 
 use atomic_waker::AtomicWaker;
 use crossbeam_channel::{bounded, Receiver, RecvTimeoutError, TryRecvError};
@@ -17,7 +11,7 @@ use crossbeam_channel::{bounded, Receiver, RecvTimeoutError, TryRecvError};
 ///
 /// Tasks implement [`Future`], so you can `.await` their completion
 /// asynchronously. Or, you can wait for their completion synchronously using
-/// the various methods provided.
+/// the various `join*` methods provided.
 ///
 /// If a task is dropped before it can be executed then its execution will be
 /// canceled. Canceling a synchronous closure after it has already started will
@@ -105,21 +99,12 @@ impl<T: Send> Task<T> {
         !self.receiver.is_empty()
     }
 
-    pub fn try_get(&mut self) -> Option<thread::Result<T>> {
-        match self.receiver.try_recv() {
-            Ok(result) => Some(result),
-            Err(TryRecvError::Empty) => None,
-            Err(e) => Some(Err(Box::new(e))),
-        }
-    }
-
     /// Block the current thread until the task completes.
     ///
     /// # Panics
     ///
-    /// If the closure the task was created from panics, the panic will
-    /// propagate to this call.
-    pub fn get(self) -> T {
+    /// If the underlying task panics, the panic will propagate to this call.
+    pub fn join(self) -> T {
         match self.receiver.recv().unwrap() {
             Ok(value) => value,
             Err(e) => resume_unwind(e),
@@ -131,10 +116,19 @@ impl<T: Send> Task<T> {
     ///
     /// # Panics
     ///
-    /// If the closure the task was created from panics, the panic will
-    /// propagate to this call.
-    pub fn get_timeout(self, timeout: Duration) -> Result<T, Self> {
-        match self.receiver.recv_timeout(timeout) {
+    /// If the underlying task panics, the panic will propagate to this call.
+    pub fn join_timeout(self, timeout: Duration) -> Result<T, Self> {
+        self.join_deadline(Instant::now() + timeout)
+    }
+
+    /// Block the current thread until the task completes or a timeout is
+    /// reached.
+    ///
+    /// # Panics
+    ///
+    /// If the underlying task panics, the panic will propagate to this call.
+    pub fn join_deadline(self, deadline: Instant) -> Result<T, Self> {
+        match self.receiver.recv_deadline(deadline) {
             Ok(Ok(value)) => Ok(value),
             Ok(Err(e)) => resume_unwind(e),
             Err(RecvTimeoutError::Timeout) => Err(self),

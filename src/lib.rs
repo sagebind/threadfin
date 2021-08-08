@@ -77,14 +77,14 @@ impl ThreadPoolBuilder {
     ///
     /// ```
     /// // Create a thread pool with exactly 2 threads.
-    /// # use squad::ThreadPool;
+    /// # use skipper::ThreadPool;
     /// let pool = ThreadPool::builder().size(2).build();
     /// ```
     ///
     /// ```
     /// // Create a thread pool with no idle threads, but will spawn up to 4
     /// // threads when there's work to be done.
-    /// # use squad::ThreadPool;
+    /// # use skipper::ThreadPool;
     /// let pool = ThreadPool::builder().size(0..4).build();
     /// ```
     ///
