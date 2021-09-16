@@ -20,6 +20,12 @@ fn invalid_size_panics() {
 }
 
 #[test]
+#[should_panic(expected = "thread pool maximum size must be non-zero")]
+fn invalid_size_zero_panics() {
+    ThreadPool::builder().size(0);
+}
+
+#[test]
 fn execute() {
     let pool = single_thread();
 

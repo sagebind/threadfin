@@ -83,17 +83,30 @@ impl ThreadPoolBuilder {
     ///
     /// ```
     /// // Create a thread pool with no idle threads, but will spawn up to 4
-    /// // threads when there's work to be done.
+    /// // threads lazily when there's work to be done.
     /// # use skipper::ThreadPool;
     /// let pool = ThreadPool::builder().size(0..4).build();
+    ///
+    /// // Or equivalently:
+    /// let pool = ThreadPool::builder().size(..4).build();
     /// ```
     ///
     /// # Panics
     ///
     /// Panics if an invalid range is supplied with a lower bound larger than
-    /// the upper bound.
+    /// the upper bound, or if the upper bound is 0.
     pub fn size<T: Into<ThreadPoolSize>>(mut self, size: T) -> Self {
-        self.size = Some(size.into());
+        let size = size.into();
+
+        if size.min > size.max {
+            panic!("thread pool minimum size cannot be larger than maximum size");
+        }
+
+        if size.max == 0 {
+            panic!("thread pool maximum size must be non-zero");
+        }
+
+        self.size = Some(size);
         self
     }
 
@@ -514,7 +527,7 @@ struct Shared {
 }
 
 mod private {
-    use std::ops::Range;
+    use std::ops::{Range, RangeTo};
 
     #[derive(Copy, Clone, Debug)]
     pub struct ThreadPoolSize {
@@ -533,12 +546,17 @@ mod private {
 
     impl From<Range<usize>> for ThreadPoolSize {
         fn from(range: Range<usize>) -> Self {
-            if range.start > range.end {
-                panic!("thread pool minimum size cannot be larger than maximum size");
-            }
-
             Self {
                 min: range.start,
+                max: range.end,
+            }
+        }
+    }
+
+    impl From<RangeTo<usize>> for ThreadPoolSize {
+        fn from(range: RangeTo<usize>) -> Self {
+            Self {
+                min: 0,
                 max: range.end,
             }
         }
