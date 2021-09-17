@@ -1,10 +1,19 @@
 //! Implementation of a task, as well as underlying primitives used to drive
 //! their execution.
 
-use std::{future::Future, panic::{catch_unwind, resume_unwind, AssertUnwindSafe}, pin::Pin, ptr, sync::Arc, task::{Context, Poll, RawWaker, RawWakerVTable, Waker}, thread, time::{Duration, Instant}};
+use std::{
+    future::Future,
+    panic::{catch_unwind, resume_unwind, AssertUnwindSafe},
+    pin::Pin,
+    ptr,
+    sync::Arc,
+    task::{Context, Poll, RawWaker, RawWakerVTable, Waker},
+    thread,
+    time::{Duration, Instant},
+};
 
 use atomic_waker::AtomicWaker;
-use crossbeam_channel::{bounded, Receiver, RecvTimeoutError, TryRecvError};
+use crossbeam_channel::{bounded, Receiver, RecvTimeoutError, Sender, TryRecvError};
 
 /// A type of future representing the result of a background computation in a
 /// thread pool.
@@ -26,68 +35,50 @@ impl<T: Send> Task<T> {
     pub(crate) fn from_closure<F>(closure: F) -> (Self, Coroutine)
     where
         F: FnOnce() -> T + Send + 'static,
-        T: 'static,
+        T: Send + 'static,
     {
-        let mut closure = Some(closure);
+        let (sender, receiver) = bounded(1);
 
-        Self::new(false, move |_cx| {
-            let closure = closure.take().unwrap();
-            Some(catch_unwind(AssertUnwindSafe(closure)))
-        })
+        let task = Task {
+            receiver,
+            waker: AssertUnwindSafe(Arc::new(AtomicWaker::new())),
+        };
+
+        let coroutine = Coroutine {
+            might_yield: false,
+            waker: empty_waker(),
+            task_waker: task.waker.clone(),
+            poller: Box::new(ClosurePoller {
+                closure: Some(closure),
+                result: None,
+                sender,
+            }),
+        };
+
+        (task, coroutine)
     }
 
     /// Create a new asynchronous task from a future.
     pub(crate) fn from_future<F>(future: F) -> (Self, Coroutine)
     where
         F: Future<Output = T> + Send + 'static,
-        T: 'static,
+        T: Send + 'static,
     {
-        let mut future = Box::pin(future);
-
-        Self::new(true, move |cx| {
-            let future = future.as_mut();
-
-            match catch_unwind(AssertUnwindSafe(|| future.poll(cx))) {
-                Ok(Poll::Pending) => None,
-                Ok(Poll::Ready(value)) => Some(Ok(value)),
-                Err(e) => Some(Err(e)),
-            }
-        })
-    }
-
-    fn new(
-        might_yield: bool,
-        mut poll: impl FnMut(&mut Context) -> Option<thread::Result<T>> + Send + 'static,
-    ) -> (Self, Coroutine)
-    where
-        T: 'static,
-    {
-        let (tx, rx) = bounded(1);
+        let (sender, receiver) = bounded(1);
 
         let task = Task {
-            receiver: rx,
+            receiver,
             waker: AssertUnwindSafe(Arc::new(AtomicWaker::new())),
         };
 
-        let mut tx = Some(tx);
-
         let coroutine = Coroutine {
-            might_yield,
-            last_result: RunResult::Yield,
+            might_yield: true,
             waker: empty_waker(),
             task_waker: task.waker.clone(),
-            poll: Box::new(move |cx| {
-                if let Some(result) = poll(cx) {
-                    let panicked = result.is_err();
-
-                    if tx.take().unwrap().send(result).is_err() {
-                        // task canceled before it could run, do nothing
-                    }
-
-                    RunResult::Complete { panicked }
-                } else {
-                    RunResult::Yield
-                }
+            poller: Box::new(FuturePoller {
+                future,
+                result: None,
+                sender,
             }),
         };
 
@@ -160,10 +151,9 @@ impl<T: Send> Future for Task<T> {
 /// underlying future to completion.
 pub(crate) struct Coroutine {
     might_yield: bool,
-    last_result: RunResult,
     waker: Waker,
     task_waker: Arc<AtomicWaker>,
-    poll: Box<dyn FnMut(&mut Context) -> RunResult + Send>,
+    poller: Box<dyn CoroutinePoller>,
 }
 
 impl Coroutine {
@@ -178,24 +168,25 @@ impl Coroutine {
         self.waker = waker;
     }
 
-    /// Run the coroutine until it yields.
+    /// Run the coroutine until it yields or completes.
     ///
-    /// Calling this function after the first time it returns `Complete` is a
-    /// no-op and will continue to return `Complete`.
+    /// Once this function returns `Complete` it should not be called again. Doing
+    /// so may panic, return weird results, or cause other problems.
     pub(crate) fn run(&mut self) -> RunResult {
-        if self.last_result == RunResult::Yield {
-            let mut cx = Context::from_waker(&self.waker);
-            self.last_result = (self.poll)(&mut cx);
-        }
-
-        self.last_result
+        let mut cx = Context::from_waker(&self.waker);
+        self.poller.run(&mut cx)
     }
 
-    /// Notify any listeners on this task that the task's state has updated.
+    /// Complete the task with the final value produced by this coroutine and
+    /// notify any listeners on this task that the task's state has updated.
+    ///
+    /// Must not be called unless `run` has returned `Complete`. This method may
+    /// panic or cause other strange behavior otherwise.
     ///
     /// You must call this yourself when the task completes. It won't be called
     /// automatically!
-    pub(crate) fn notify(&self) {
+    pub(crate) fn complete(mut self) {
+        self.poller.complete();
         self.task_waker.wake();
     }
 }
@@ -207,11 +198,9 @@ pub(crate) enum RunResult {
     Yield,
 
     /// The coroutine and its associated task has completed. You should call
-    /// [`Coroutine::notify`] to wake any consumers of the task to receive the
+    /// [`Coroutine::complete`] to wake any consumers of the task to receive the
     /// task result.
-    Complete {
-        panicked: bool,
-    },
+    Complete { panicked: bool },
 }
 
 /// Creates a dummy waker that does nothing.
@@ -220,4 +209,87 @@ fn empty_waker() -> Waker {
     const VTABLE: RawWakerVTable = RawWakerVTable::new(|_| RAW_WAKER, |_| {}, |_| {}, |_| {});
 
     unsafe { Waker::from_raw(RAW_WAKER) }
+}
+
+/// Inner implementation of a coroutine. This trait is used to erase the return
+/// value from the coroutine type as well as to abstract over futures and
+/// synchronous closures. Bundling all the required operations into this trait
+/// also allows us to minimize the number of heap allocations per task.
+trait CoroutinePoller: Send {
+    fn run(&mut self, cx: &mut Context) -> RunResult;
+
+    fn complete(&mut self);
+}
+
+struct ClosurePoller<F, T> {
+    closure: Option<F>,
+    result: Option<thread::Result<T>>,
+    sender: Sender<thread::Result<T>>,
+}
+
+impl<F, T> CoroutinePoller for ClosurePoller<F, T>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send,
+{
+    fn run(&mut self, _cx: &mut Context) -> RunResult {
+        let closure = self
+            .closure
+            .take()
+            .expect("closure already ran to completion");
+        let result = catch_unwind(AssertUnwindSafe(closure));
+        let panicked = result.is_err();
+
+        self.result = Some(result);
+
+        RunResult::Complete { panicked }
+    }
+
+    fn complete(&mut self) {
+        if let Some(result) = self.result.take() {
+            if self.sender.send(result).is_err() {
+                // task canceled before it could run, do nothing
+            }
+        }
+    }
+}
+
+struct FuturePoller<F, T> {
+    future: F,
+    result: Option<thread::Result<T>>,
+    sender: Sender<thread::Result<T>>,
+}
+
+impl<F, T> CoroutinePoller for FuturePoller<F, T>
+where
+    F: Future<Output = T> + Send + 'static,
+    T: Send,
+{
+    fn run(&mut self, cx: &mut Context) -> RunResult {
+        // Safety: This struct is only ever used inside a box, so we know that
+        // neither self nor this future will move.
+        let future = unsafe { Pin::new_unchecked(&mut self.future) };
+
+        match catch_unwind(AssertUnwindSafe(|| future.poll(cx))) {
+            Ok(Poll::Pending) => RunResult::Yield,
+            Ok(Poll::Ready(value)) => {
+                self.result = Some(Ok(value));
+
+                RunResult::Complete { panicked: false }
+            }
+            Err(e) => {
+                self.result = Some(Err(e));
+
+                RunResult::Complete { panicked: true }
+            }
+        }
+    }
+
+    fn complete(&mut self) {
+        if let Some(result) = self.result.take() {
+            if self.sender.send(result).is_err() {
+                // task canceled before it could run, do nothing
+            }
+        }
+    }
 }

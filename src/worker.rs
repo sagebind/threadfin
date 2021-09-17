@@ -171,7 +171,7 @@ impl<L: Listener> Worker<L> {
 
         if let RunResult::Complete { panicked } = coroutine.run() {
             self.listener.on_task_completed(panicked);
-            coroutine.notify();
+            coroutine.complete();
         } else {
             // This should never happen if the task promised not to yield!
             debug_assert!(coroutine.might_yield());
@@ -193,10 +193,9 @@ impl<L: Listener> Worker<L> {
         if let Some(coroutine) = self.pending_tasks.get_mut(id) {
             if let RunResult::Complete { panicked } = coroutine.run() {
                 self.listener.on_task_completed(panicked);
-                coroutine.notify();
 
-                // Task is complete, we can de-allocate it.
-                self.pending_tasks.remove(id);
+                // Task is complete, we can de-allocate it and complete it.
+                self.pending_tasks.remove(id).complete();
             }
         }
     }
