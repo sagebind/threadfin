@@ -16,6 +16,7 @@ use crossbeam_channel::{bounded, unbounded, Receiver, Sender};
 use once_cell::sync::OnceCell;
 
 mod task;
+mod wakers;
 mod worker;
 
 use private::ThreadPoolSize;

@@ -5,15 +5,11 @@ use std::{
     future::Future,
     panic::{catch_unwind, resume_unwind, AssertUnwindSafe},
     pin::Pin,
-    ptr,
-    sync::Arc,
-    task::{Context, Poll, RawWaker, RawWakerVTable, Waker},
+    sync::{Arc, Mutex},
+    task::{Context, Poll, Waker},
     thread,
     time::{Duration, Instant},
 };
-
-use atomic_waker::AtomicWaker;
-use crossbeam_channel::{bounded, Receiver, RecvTimeoutError, Sender, TryRecvError};
 
 /// A type of future representing the result of a background computation in a
 /// thread pool.
@@ -26,8 +22,12 @@ use crossbeam_channel::{bounded, Receiver, RecvTimeoutError, Sender, TryRecvErro
 /// canceled. Canceling a synchronous closure after it has already started will
 /// have no effect.
 pub struct Task<T: Send> {
-    receiver: Receiver<thread::Result<T>>,
-    waker: AssertUnwindSafe<Arc<AtomicWaker>>,
+    inner: Arc<Mutex<Inner<T>>>,
+}
+
+struct Inner<T> {
+    result: Option<thread::Result<T>>,
+    waker: Option<Waker>,
 }
 
 impl<T: Send> Task<T> {
@@ -37,21 +37,15 @@ impl<T: Send> Task<T> {
         F: FnOnce() -> T + Send + 'static,
         T: Send + 'static,
     {
-        let (sender, receiver) = bounded(1);
-
-        let task = Task {
-            receiver,
-            waker: AssertUnwindSafe(Arc::new(AtomicWaker::new())),
-        };
+        let task = Self::pending();
 
         let coroutine = Coroutine {
             might_yield: false,
-            waker: empty_waker(),
-            task_waker: task.waker.clone(),
+            waker: crate::wakers::empty_waker(),
             poller: Box::new(ClosurePoller {
                 closure: Some(closure),
                 result: None,
-                sender,
+                task: task.inner.clone(),
             }),
         };
 
@@ -64,30 +58,33 @@ impl<T: Send> Task<T> {
         F: Future<Output = T> + Send + 'static,
         T: Send + 'static,
     {
-        let (sender, receiver) = bounded(1);
-
-        let task = Task {
-            receiver,
-            waker: AssertUnwindSafe(Arc::new(AtomicWaker::new())),
-        };
+        let task = Self::pending();
 
         let coroutine = Coroutine {
             might_yield: true,
-            waker: empty_waker(),
-            task_waker: task.waker.clone(),
+            waker: crate::wakers::empty_waker(),
             poller: Box::new(FuturePoller {
                 future,
                 result: None,
-                sender,
+                task: task.inner.clone(),
             }),
         };
 
         (task, coroutine)
     }
 
+    fn pending() -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(Inner {
+                result: None,
+                waker: None,
+            })),
+        }
+    }
+
     /// Check if the task is done yet.
     pub fn is_done(&self) -> bool {
-        !self.receiver.is_empty()
+        self.inner.lock().unwrap().result.is_some()
     }
 
     /// Block the current thread until the task completes.
@@ -96,7 +93,24 @@ impl<T: Send> Task<T> {
     ///
     /// If the underlying task panics, the panic will propagate to this call.
     pub fn join(self) -> T {
-        match self.receiver.recv().unwrap() {
+        match {
+            let mut inner = self.inner.lock().unwrap();
+
+            if let Some(result) = inner.result.take() {
+                result
+            } else {
+                inner.waker.insert(crate::wakers::current_thread_waker());
+                drop(inner);
+
+                loop {
+                    thread::park();
+
+                    if let Some(result) = self.inner.lock().unwrap().result.take() {
+                        break result;
+                    }
+                }
+            }
+        } {
             Ok(value) => value,
             Err(e) => resume_unwind(e),
         }
@@ -119,13 +133,30 @@ impl<T: Send> Task<T> {
     ///
     /// If the underlying task panics, the panic will propagate to this call.
     pub fn join_deadline(self, deadline: Instant) -> Result<T, Self> {
-        match self.receiver.recv_deadline(deadline) {
-            Ok(Ok(value)) => Ok(value),
-            Ok(Err(e)) => resume_unwind(e),
-            Err(RecvTimeoutError::Timeout) => Err(self),
-            Err(RecvTimeoutError::Disconnected) => {
-                panic!("task was dropped by thread pool without being completed")
+        match {
+            let mut inner = self.inner.lock().unwrap();
+
+            if let Some(result) = inner.result.take() {
+                result
+            } else {
+                inner.waker.insert(crate::wakers::current_thread_waker());
+                drop(inner);
+
+                loop {
+                    if let Some(timeout) = deadline.checked_duration_since(Instant::now()) {
+                        thread::park_timeout(timeout);
+                    } else {
+                        return Err(self);
+                    }
+
+                    if let Some(result) = self.inner.lock().unwrap().result.take() {
+                        break result;
+                    }
+                }
             }
+        } {
+            Ok(value) => Ok(value),
+            Err(e) => resume_unwind(e),
         }
     }
 }
@@ -134,14 +165,14 @@ impl<T: Send> Future for Task<T> {
     type Output = T;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        self.waker.register(cx.waker());
+        let mut inner = self.inner.lock().unwrap();
 
-        match self.receiver.try_recv() {
-            Ok(Ok(value)) => Poll::Ready(value),
-            Ok(Err(e)) => resume_unwind(e),
-            Err(TryRecvError::Empty) => Poll::Pending,
-            Err(TryRecvError::Disconnected) => {
-                panic!("task was dropped by thread pool without being completed")
+        match inner.result.take() {
+            Some(Ok(value)) => Poll::Ready(value),
+            Some(Err(e)) => resume_unwind(e),
+            None => {
+                inner.waker.insert(cx.waker().clone());
+                return Poll::Pending;
             }
         }
     }
@@ -152,7 +183,6 @@ impl<T: Send> Future for Task<T> {
 pub(crate) struct Coroutine {
     might_yield: bool,
     waker: Waker,
-    task_waker: Arc<AtomicWaker>,
     poller: Box<dyn CoroutinePoller>,
 }
 
@@ -187,7 +217,6 @@ impl Coroutine {
     /// automatically!
     pub(crate) fn complete(mut self) {
         self.poller.complete();
-        self.task_waker.wake();
     }
 }
 
@@ -203,14 +232,6 @@ pub(crate) enum RunResult {
     Complete { panicked: bool },
 }
 
-/// Creates a dummy waker that does nothing.
-fn empty_waker() -> Waker {
-    const RAW_WAKER: RawWaker = RawWaker::new(ptr::null(), &VTABLE);
-    const VTABLE: RawWakerVTable = RawWakerVTable::new(|_| RAW_WAKER, |_| {}, |_| {}, |_| {});
-
-    unsafe { Waker::from_raw(RAW_WAKER) }
-}
-
 /// Inner implementation of a coroutine. This trait is used to erase the return
 /// value from the coroutine type as well as to abstract over futures and
 /// synchronous closures. Bundling all the required operations into this trait
@@ -224,7 +245,7 @@ trait CoroutinePoller: Send {
 struct ClosurePoller<F, T> {
     closure: Option<F>,
     result: Option<thread::Result<T>>,
-    sender: Sender<thread::Result<T>>,
+    task: Arc<Mutex<Inner<T>>>,
 }
 
 impl<F, T> CoroutinePoller for ClosurePoller<F, T>
@@ -247,9 +268,13 @@ where
 
     fn complete(&mut self) {
         if let Some(result) = self.result.take() {
-            if self.sender.send(result).is_err() {
-                // task canceled before it could run, do nothing
-            }
+            let mut task = self.task.lock().unwrap();
+
+            task.result.insert(result);
+
+            if let Some(waker) = task.waker.as_ref() {
+                waker.wake_by_ref();
+            };
         }
     }
 }
@@ -257,7 +282,7 @@ where
 struct FuturePoller<F, T> {
     future: F,
     result: Option<thread::Result<T>>,
-    sender: Sender<thread::Result<T>>,
+    task: Arc<Mutex<Inner<T>>>,
 }
 
 impl<F, T> CoroutinePoller for FuturePoller<F, T>
@@ -287,9 +312,13 @@ where
 
     fn complete(&mut self) {
         if let Some(result) = self.result.take() {
-            if self.sender.send(result).is_err() {
-                // task canceled before it could run, do nothing
-            }
+            let mut task = self.task.lock().unwrap();
+
+            task.result.insert(result);
+
+            if let Some(waker) = task.waker.as_ref() {
+                waker.wake_by_ref();
+            };
         }
     }
 }
