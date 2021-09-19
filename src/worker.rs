@@ -20,13 +20,13 @@ pub(crate) trait Listener {
 pub(crate) struct Worker<L: Listener> {
     idle_timeout: Duration,
 
+    concurrency_limit: usize,
+
     /// An initial task this worker should be run before polling for new work.
     initial_task: Option<Coroutine>,
 
     /// Pending tasks being run by this worker. Any task that yields without
     /// being immediately complete is moved to this location to be polled again.
-    ///
-    /// TODO: Should we set a limit on concurrency per worker?
     pending_tasks: Slab<Coroutine>,
 
     /// Queue of new tasks to run. The worker pulls more tasks from this queue
@@ -45,18 +45,18 @@ pub(crate) struct Worker<L: Listener> {
 }
 
 impl<L: Listener> Worker<L> {
-    const CONCURRENCY_LIMIT: usize = 16;
-
     /// Create a new worker.
     pub(crate) fn new(
         initial_task: Option<Coroutine>,
         queue: Receiver<Coroutine>,
         immediate_queue: Receiver<Coroutine>,
+        concurrency_limit: usize,
         idle_timeout: Duration,
         listener: L,
     ) -> Self {
         Self {
             idle_timeout,
+            concurrency_limit,
             initial_task,
             pending_tasks: Slab::new(),
             queue,
@@ -106,7 +106,7 @@ impl<L: Listener> Worker<L> {
 
         // As long as we haven't reached our concurrency limit, poll for
         // additional work.
-        if self.active && self.pending_tasks.len() < Self::CONCURRENCY_LIMIT {
+        if self.active && self.pending_tasks.len() < self.concurrency_limit {
             queue_id = Some(select.recv(&self.queue));
             immediate_queue_id = Some(select.recv(&self.immediate_queue));
         }
@@ -117,25 +117,24 @@ impl<L: Listener> Worker<L> {
         }
 
         match select.select_timeout(self.idle_timeout) {
-            Ok(op) => {
-                if Some(op.index()) == queue_id {
-                    if let Ok(coroutine) = op.recv(&self.queue) {
-                        PollResult::Work(coroutine)
-                    } else {
-                        PollResult::ShutDown
-                    }
-                } else if Some(op.index()) == immediate_queue_id {
-                    if let Ok(coroutine) = op.recv(&self.immediate_queue) {
-                        PollResult::Work(coroutine)
-                    } else {
-                        PollResult::ShutDown
-                    }
-                } else if Some(op.index()) == wake_id {
-                    PollResult::Wake(op.recv(&self.wake_notifications.1).unwrap())
+            Ok(op) if Some(op.index()) == queue_id => {
+                if let Ok(coroutine) = op.recv(&self.queue) {
+                    PollResult::Work(coroutine)
                 } else {
-                    unreachable!()
+                    PollResult::ShutDown
                 }
             }
+            Ok(op) if Some(op.index()) == immediate_queue_id => {
+                if let Ok(coroutine) = op.recv(&self.immediate_queue) {
+                    PollResult::Work(coroutine)
+                } else {
+                    PollResult::ShutDown
+                }
+            }
+            Ok(op) if Some(op.index()) == wake_id => {
+                PollResult::Wake(op.recv(&self.wake_notifications.1).unwrap())
+            }
+            Ok(_) => unreachable!(),
             Err(_) => PollResult::Timeout,
         }
     }

@@ -3,11 +3,18 @@ name = "skipper"
 version = "0.1.0"
 edition = "2018"
 
+[features]
+default = ["common"]
+common = ["once_cell"]
+
 [dependencies]
 core_affinity = "0.5"
 crossbeam-channel = "0.5"
-once_cell = "1.8"
 slab = "0.4"
+
+[dependencies.once_cell]
+version = "1.8"
+optional = true
 
 [dev-dependencies]
 futures-timer = "3"

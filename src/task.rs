@@ -83,11 +83,14 @@ impl<T: Send> Task<T> {
     }
 
     /// Check if the task is done yet.
+    ///
+    /// If this method returns true, then [`Task::join`] will not block.
     pub fn is_done(&self) -> bool {
         self.inner.lock().unwrap().result.is_some()
     }
 
-    /// Block the current thread until the task completes.
+    /// Block the current thread until the task completes and return the value
+    /// the task produced.
     ///
     /// # Panics
     ///

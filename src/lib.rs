@@ -13,7 +13,6 @@ use std::{
 
 use core_affinity::CoreId;
 use crossbeam_channel::{bounded, unbounded, Receiver, Sender};
-use once_cell::sync::OnceCell;
 
 mod task;
 mod wakers;
@@ -32,6 +31,7 @@ pub struct ThreadPoolBuilder {
     size: Option<ThreadPoolSize>,
     stack_size: Option<usize>,
     queue_limit: Option<usize>,
+    worker_concurrency_limit: usize,
     idle_timeout: Duration,
 }
 
@@ -42,6 +42,7 @@ impl Default for ThreadPoolBuilder {
             size: None,
             stack_size: None,
             queue_limit: None,
+            worker_concurrency_limit: 16,
             idle_timeout: Duration::from_secs(60),
         }
     }
@@ -134,8 +135,34 @@ impl ThreadPoolBuilder {
         self
     }
 
+    /// Set a timeout for idle worker threads.
+    ///
+    /// If the pool has more than the minimum configured number of threads and
+    /// threads remain idle for more than this duration, they will be terminated
+    /// until the minimum thread count is reached.
     pub fn idle_timeout(mut self, timeout: Duration) -> Self {
         self.idle_timeout = timeout;
+        self
+    }
+
+    /// Set a limit on the number of concurrent tasks that can be run by a
+    /// single worker thread.
+    ///
+    /// When executing asynchronous tasks, if the underlying future being
+    /// executed yields, that worker thread can begin working on new tasks
+    /// concurrently while waiting on the prior task to resume. This allows for
+    /// a primitive M:N scheduling model that supports running significantly
+    /// more futures concurrently than the number of threads in the thread pool.
+    ///
+    /// To prevent a worker thread from over-committing to too many tasks at
+    /// once (which could result in extra latency if a task wakes but its
+    /// assigned worker is too busy with other tasks) worker threads limit
+    /// themselves to a maximum number of concurrent tasks. This method allows
+    /// you to customize that limit.
+    ///
+    /// The default limit if not specified is 16.
+    pub fn worker_concurrency_limit(mut self, limit: usize) -> Self {
+        self.worker_concurrency_limit = limit;
         self
     }
 
@@ -170,6 +197,7 @@ impl ThreadPoolBuilder {
         let pool = ThreadPool {
             thread_name: self.name,
             stack_size: self.stack_size,
+            concurrency_limit: self.worker_concurrency_limit,
             queue: self.queue_limit.map(bounded).unwrap_or_else(unbounded),
             immediate_queue: bounded(0),
             core_ids,
@@ -194,6 +222,7 @@ impl ThreadPoolBuilder {
 pub struct ThreadPool {
     thread_name: Option<String>,
     stack_size: Option<usize>,
+    concurrency_limit: usize,
     queue: (Sender<Coroutine>, Receiver<Coroutine>),
     immediate_queue: (Sender<Coroutine>, Receiver<Coroutine>),
     core_ids: Option<Vec<CoreId>>,
@@ -207,7 +236,12 @@ impl Default for ThreadPool {
 }
 
 impl ThreadPool {
+    /// Get a shared reference to a common, shared thread pool for the current
+    /// process.
+    #[cfg(feature = "common")]
     pub fn common() -> &'static Self {
+        use once_cell::sync::OnceCell;
+
         static COMMON: OnceCell<ThreadPool> = OnceCell::new();
 
         COMMON.get_or_init(Self::default)
@@ -268,9 +302,9 @@ impl ThreadPool {
         T: Send + 'static,
         F: FnOnce() -> T + Send + 'static,
     {
-        let (task, runner) = Task::from_closure(closure);
+        let (task, coroutine) = Task::from_closure(closure);
 
-        self.execute_runner(runner);
+        self.execute_coroutine(coroutine);
 
         task
     }
@@ -281,9 +315,9 @@ impl ThreadPool {
         T: Send + 'static,
         F: Future<Output = T> + Send + 'static,
     {
-        let (task, runner) = Task::from_future(future);
+        let (task, coroutine) = Task::from_future(future);
 
-        self.execute_runner(runner);
+        self.execute_coroutine(coroutine);
 
         task
     }
@@ -296,9 +330,9 @@ impl ThreadPool {
         T: Send + 'static,
         F: FnOnce() -> T + Send + 'static,
     {
-        let (task, runner) = Task::from_closure(closure);
+        let (task, coroutine) = Task::from_closure(closure);
 
-        self.try_execute_runner(runner).ok().map(|_| task)
+        self.try_execute_coroutine(coroutine).ok().map(|_| task)
     }
 
     /// Execute a future on the thread pool.
@@ -309,22 +343,22 @@ impl ThreadPool {
         T: Send + 'static,
         F: Future<Output = T> + Send + 'static,
     {
-        let (task, runner) = Task::from_future(future);
+        let (task, coroutine) = Task::from_future(future);
 
-        self.try_execute_runner(runner).ok().map(|_| task)
+        self.try_execute_coroutine(coroutine).ok().map(|_| task)
     }
 
-    fn execute_runner(&self, runner: Coroutine) {
-        if let Err(runner) = self.try_execute_runner(runner) {
-            self.queue.0.send(runner).unwrap();
+    fn execute_coroutine(&self, coroutine: Coroutine) {
+        if let Err(coroutine) = self.try_execute_coroutine(coroutine) {
+            self.queue.0.send(coroutine).unwrap();
         }
     }
 
-    fn try_execute_runner(&self, runner: Coroutine) -> Result<(), Coroutine> {
+    fn try_execute_coroutine(&self, coroutine: Coroutine) -> Result<(), Coroutine> {
         // First, try to pass the coroutine to an idle worker currently polling
         // for work. This is the most favorable scenario for a task to begin
         // processing.
-        if let Err(e) = self.immediate_queue.0.try_send(runner) {
+        if let Err(e) = self.immediate_queue.0.try_send(coroutine) {
             // Error means no workers are currently polling the queue.
             debug_assert!(!e.is_disconnected());
 
@@ -482,6 +516,7 @@ impl ThreadPool {
             initial_task,
             self.queue.1.clone(),
             self.immediate_queue.1.clone(),
+            self.concurrency_limit,
             self.shared.idle_timeout,
             WorkerListener {
                 shared: self.shared.clone(),
