@@ -102,7 +102,7 @@ impl<T: Send> Task<T> {
             if let Some(result) = inner.result.take() {
                 result
             } else {
-                inner.waker.insert(crate::wakers::current_thread_waker());
+                inner.waker = Some(crate::wakers::current_thread_waker());
                 drop(inner);
 
                 loop {
@@ -142,7 +142,7 @@ impl<T: Send> Task<T> {
             if let Some(result) = inner.result.take() {
                 result
             } else {
-                inner.waker.insert(crate::wakers::current_thread_waker());
+                inner.waker = Some(crate::wakers::current_thread_waker());
                 drop(inner);
 
                 loop {
@@ -174,7 +174,7 @@ impl<T: Send> Future for Task<T> {
             Some(Ok(value)) => Poll::Ready(value),
             Some(Err(e)) => resume_unwind(e),
             None => {
-                inner.waker.insert(cx.waker().clone());
+                inner.waker = Some(cx.waker().clone());
                 return Poll::Pending;
             }
         }
@@ -273,7 +273,7 @@ where
         if let Some(result) = self.result.take() {
             let mut task = self.task.lock().unwrap();
 
-            task.result.insert(result);
+            task.result = Some(result);
 
             if let Some(waker) = task.waker.as_ref() {
                 waker.wake_by_ref();
@@ -317,7 +317,7 @@ where
         if let Some(result) = self.result.take() {
             let mut task = self.task.lock().unwrap();
 
-            task.result.insert(result);
+            task.result = Some(result);
 
             if let Some(waker) = task.waker.as_ref() {
                 waker.wake_by_ref();
