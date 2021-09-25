@@ -1,3 +1,5 @@
+//! Implementation of the thread pool itself.
+
 use std::{
     fmt,
     future::Future,
@@ -60,7 +62,16 @@ impl SizeConstraint for RangeTo<usize> {
     }
 }
 
-/// A builder for constructing a customized thread pool.
+/// A builder for constructing a customized [`ThreadPool`].
+///
+/// # Examples
+///
+/// ```
+/// let custom_pool = threadfin::ThreadPool::builder()
+///     .name("my-pool")
+///     .size(2)
+///     .build();
+/// ```
 #[derive(Debug)]
 pub struct Builder {
     name: Option<String>,
@@ -90,6 +101,12 @@ impl Builder {
     /// # Panics
     ///
     /// Panics if the name contains null bytes (`\0`).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let pool = threadfin::ThreadPool::builder().name("my-pool").build();
+    /// ```
     pub fn name<T: Into<String>>(mut self, name: T) -> Self {
         let name = name.into();
 
@@ -152,6 +169,19 @@ impl Builder {
     ///
     /// The actual stack size may be greater than this value if the platform
     /// enforces a larger minimum stack size.
+    ///
+    /// The stack size if not specified will be the default size for new Rust
+    /// threads, currently 2 MiB. This can also be overridden by setting the
+    /// `RUST_MIN_STACK` environment variable if not specified in code.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use threadfin::ThreadPool;
+    ///
+    /// // Worker threads will have a stack size of at least 32 KiB.
+    /// let pool = ThreadPool::builder().stack_size(32 * 1024).build();
+    /// ```
     pub fn stack_size(mut self, size: usize) -> Self {
         self.stack_size = Some(size);
         self
@@ -247,7 +277,7 @@ impl Builder {
     }
 }
 
-/// A thread pool.
+/// A thread pool for running multiple tasks on a configurable group of threads.
 ///
 /// Dropping the thread pool will prevent any further tasks from being scheduled
 /// on the pool and detaches all threads in the pool. If you want to block until

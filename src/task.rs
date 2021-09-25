@@ -14,16 +14,53 @@ use std::{
 };
 
 /// A type of future representing the result of a background computation in a
+/// thread pool. Tasks are returned when submitting a closure or future to a
 /// thread pool.
 ///
 /// Tasks implement [`Future`], so you can `.await` their completion
 /// asynchronously. Or, you can wait for their completion synchronously using
-/// the various `join*` methods provided.
+/// the various [`join`](Task::join) methods provided.
 ///
-/// If a task is dropped before it can be executed then its execution will be
-/// canceled. Canceling a synchronous closure after it has already started will
-/// have no effect.
-pub struct Task<T: Send> {
+/// Dropping a task detaches the running task, but does not cancel it. The task
+/// will continue to run on the thread pool until completion, but there will no
+/// longer be any way to check its completion or to retrieve its returned value.
+///
+/// # Examples
+///
+/// Detaching a task:
+///
+/// ```
+/// use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+/// use std::thread::sleep;
+/// use std::time::Duration;
+/// use threadfin::ThreadPool;
+///
+/// let pool = Arc::new(ThreadPool::new());
+/// let completed = Arc::new(AtomicBool::from(false));
+///
+/// // Clone the shared values to be used inside the task.
+/// let pool_clone = pool.clone();
+/// let completed_clone = completed.clone();
+///
+/// pool.execute(move || {
+///     let _inner_task = pool_clone.execute(move || {
+///         // Short delay simulating some work.
+///         sleep(Duration::from_millis(100));
+///
+///         // Set as complete.
+///         completed_clone.store(true, Ordering::SeqCst);
+///     });
+///
+///     // Inner task is detached, but will still complete.
+/// });
+///
+/// // Give the task some time to complete.
+/// sleep(Duration::from_millis(1000));
+///
+/// // Inner task completed even though it was detached.
+/// assert_eq!(completed.load(Ordering::SeqCst), true);
+/// ```
+pub struct Task<T> {
     inner: Arc<Mutex<Inner<T>>>,
 }
 
@@ -32,7 +69,7 @@ struct Inner<T> {
     waker: Option<Waker>,
 }
 
-impl<T: Send> Task<T> {
+impl<T> Task<T> {
     /// Create a new task from a closure.
     pub(crate) fn from_closure<F>(closure: F) -> (Self, Coroutine)
     where
@@ -86,7 +123,8 @@ impl<T: Send> Task<T> {
 
     /// Check if the task is done yet.
     ///
-    /// If this method returns true, then [`Task::join`] will not block.
+    /// If this method returns true, then calling [`join`](Task::join) will not
+    /// block.
     pub fn is_done(&self) -> bool {
         self.inner.lock().unwrap().result.is_some()
     }
@@ -98,26 +136,28 @@ impl<T: Send> Task<T> {
     ///
     /// If the underlying task panics, the panic will propagate to this call.
     pub fn join(self) -> T {
-        match {
-            let mut inner = self.inner.lock().unwrap();
-
-            if let Some(result) = inner.result.take() {
-                result
-            } else {
-                inner.waker = Some(crate::wakers::current_thread_waker());
-                drop(inner);
-
-                loop {
-                    thread::park();
-
-                    if let Some(result) = self.inner.lock().unwrap().result.take() {
-                        break result;
-                    }
-                }
-            }
-        } {
+        match self.join_catch() {
             Ok(value) => value,
             Err(e) => resume_unwind(e),
+        }
+    }
+
+    fn join_catch(self) -> thread::Result<T> {
+        let mut inner = self.inner.lock().unwrap();
+
+        if let Some(result) = inner.result.take() {
+            result
+        } else {
+            inner.waker = Some(crate::wakers::current_thread_waker());
+            drop(inner);
+
+            loop {
+                thread::park();
+
+                if let Some(result) = self.inner.lock().unwrap().result.take() {
+                    break result;
+                }
+            }
         }
     }
 
@@ -166,7 +206,7 @@ impl<T: Send> Task<T> {
     }
 }
 
-impl<T: Send> Future for Task<T> {
+impl<T> Future for Task<T> {
     type Output = T;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
@@ -183,7 +223,7 @@ impl<T: Send> Future for Task<T> {
     }
 }
 
-impl<T: Send> fmt::Debug for Task<T> {
+impl<T> fmt::Debug for Task<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Task")
             .field("done", &self.is_done())
@@ -204,6 +244,11 @@ impl Coroutine {
     /// optimizations if you know for certain a waker will never be used.
     pub(crate) fn might_yield(&self) -> bool {
         self.might_yield
+    }
+
+    /// Get the unique memory address for this coroutine.
+    pub(crate) fn addr(&self) -> usize {
+        &*self.poller as *const dyn CoroutinePoller as *const () as usize
     }
 
     /// Set the waker to use with this task.

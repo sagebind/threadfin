@@ -10,7 +10,6 @@ common = ["once_cell"]
 [dependencies]
 core_affinity = "0.5"
 crossbeam-channel = "0.5"
-slab = "0.4"
 
 [dependencies.once_cell]
 version = "1.8"

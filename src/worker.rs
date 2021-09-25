@@ -1,7 +1,6 @@
-use std::{sync::Arc, task::Wake, time::Duration};
+use std::{collections::HashMap, sync::Arc, task::Wake, time::Duration};
 
 use crossbeam_channel::{unbounded, Receiver, Select, Sender};
-use slab::Slab;
 
 use crate::task::{Coroutine, RunResult};
 
@@ -27,7 +26,7 @@ pub(crate) struct Worker<L: Listener> {
 
     /// Pending tasks being run by this worker. Any task that yields without
     /// being immediately complete is moved to this location to be polled again.
-    pending_tasks: Slab<Coroutine>,
+    pending_tasks: HashMap<usize, Coroutine>,
 
     /// Queue of new tasks to run. The worker pulls more tasks from this queue
     /// when idle.
@@ -58,7 +57,7 @@ impl<L: Listener> Worker<L> {
             idle_timeout,
             concurrency_limit,
             initial_task,
-            pending_tasks: Slab::new(),
+            pending_tasks: HashMap::new(),
             queue,
             immediate_queue,
             wake_notifications: unbounded(),
@@ -140,8 +139,6 @@ impl<L: Listener> Worker<L> {
     }
 
     fn run_now_or_reschedule(&mut self, mut coroutine: Coroutine) {
-        let vacant_entry = self.pending_tasks.vacant_entry();
-
         // If it is possible for this task to yield, we need to prepare a new
         // waker to receive notifications with.
         if coroutine.might_yield() {
@@ -158,11 +155,7 @@ impl<L: Listener> Worker<L> {
             }
 
             coroutine.set_waker(
-                Arc::new(IdWaker(
-                    vacant_entry.key(),
-                    self.wake_notifications.0.clone(),
-                ))
-                .into(),
+                Arc::new(IdWaker(coroutine.addr(), self.wake_notifications.0.clone())).into(),
             );
         }
 
@@ -184,17 +177,17 @@ impl<L: Listener> Worker<L> {
             // back through the queue is that the future gets executed (almost)
             // immediately once it wakes instead of being put behind a queue of
             // _new_ tasks.
-            vacant_entry.insert(coroutine);
+            self.pending_tasks.insert(coroutine.addr(), coroutine);
         }
     }
 
     fn run_pending_by_id(&mut self, id: usize) {
-        if let Some(coroutine) = self.pending_tasks.get_mut(id) {
+        if let Some(coroutine) = self.pending_tasks.get_mut(&id) {
             if let RunResult::Complete { panicked } = coroutine.run() {
                 self.listener.on_task_completed(panicked);
 
                 // Task is complete, we can de-allocate it and complete it.
-                self.pending_tasks.remove(id).complete();
+                self.pending_tasks.remove(&id).unwrap().complete();
             }
         }
     }

@@ -4,9 +4,10 @@ A thread pool for running multiple tasks on a configurable group of threads.
 
 Extra features:
 
-- Optional common process-wide thread pool
-- Support for async tasks
 - Dynamic pool size based on load
+- Support for async tasks
+- Tasks return a handle which can be joined or awaited for the return value
+- Optional common process-wide thread pool
 - CPU core pinning
 
 ## Examples
@@ -19,8 +20,10 @@ let pool = ThreadPool::builder().size(8).build();
 
 ## Other libraries
 
-- [threadpool](https://github.com/rust-threadpool/rust-threadpool): More popular but less customizable.
-- [rayon](https://github.com/rayon-rs/rayon): Designed for data parallelization, operates at a higher abstraction layer.
+- [threadpool](https://github.com/rust-threadpool/rust-threadpool)
+- [scoped_threadpool](https://github.com/kimundi/scoped-threadpool-rs)
+- [rusty_pool](https://github.com/robinfriedli/rusty_pool)
+- [rayon](https://github.com/rayon-rs/rayon)
 
 ## License
 
