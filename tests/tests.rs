@@ -96,22 +96,30 @@ fn try_execute_under_core_count() {
     thread::sleep(Duration::from_millis(50));
     assert_eq!(pool.threads(), 1);
 
-    assert!(pool.try_execute(|| 2 + 2).is_some());
+    assert!(pool.try_execute(|| 2 + 2).is_ok());
 }
 
 #[test]
 fn try_execute_over_core_count() {
     let pool = ThreadPool::builder().size(0..1).build();
 
-    assert!(pool.try_execute(|| 2 + 2).is_some());
+    assert!(pool.try_execute(|| 2 + 2).is_ok());
 }
 
 #[test]
 fn try_execute_over_limit() {
     let pool = ThreadPool::builder().size(0..1).queue_limit(0).build();
 
-    assert!(pool.try_execute(|| 2 + 2).is_some());
-    assert!(pool.try_execute(|| 2 + 2).is_none());
+    assert!(pool.try_execute(|| 2 + 2).is_ok());
+    assert!(pool.try_execute(|| 2 + 2).is_err());
+
+    fn task() -> usize {
+        2 + 2
+    }
+
+    // The returned function in the error is identical to the function given.
+    let error = pool.try_execute(task).unwrap_err();
+    assert_eq!(error.into_inner() as usize, task as usize);
 }
 
 #[test]

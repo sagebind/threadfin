@@ -2,6 +2,8 @@
 //! their execution.
 
 use std::{
+    any::Any,
+    fmt,
     future::Future,
     panic::{catch_unwind, resume_unwind, AssertUnwindSafe},
     pin::Pin,
@@ -181,6 +183,14 @@ impl<T: Send> Future for Task<T> {
     }
 }
 
+impl<T: Send> fmt::Debug for Task<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Task")
+            .field("done", &self.is_done())
+            .finish()
+    }
+}
+
 /// The worker side of an allocated task, which provides methods for running the
 /// underlying future to completion.
 pub(crate) struct Coroutine {
@@ -221,6 +231,38 @@ impl Coroutine {
     pub(crate) fn complete(mut self) {
         self.poller.complete();
     }
+
+    /// Unwrap the original closure the coroutine was created from. Panics if
+    /// the coroutine was not created from a closure.
+    pub(crate) fn into_inner_closure<F, T>(self) -> F
+    where
+        F: FnOnce() -> T + Send + 'static,
+        T: Send + 'static,
+    {
+        (*self
+            .poller
+            .into_any()
+            .downcast::<ClosurePoller<F, T>>()
+            .unwrap())
+        .closure
+        .take()
+        .unwrap()
+    }
+
+    /// Unwrap the original future the coroutine was created from. Panics if the
+    /// coroutine was not created from a future.
+    pub(crate) fn into_inner_future<F, T>(self) -> F
+    where
+        F: Future<Output = T> + Send + 'static,
+        T: Send + 'static,
+    {
+        (*self
+            .poller
+            .into_any()
+            .downcast::<FuturePoller<F, T>>()
+            .unwrap())
+        .future
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -239,10 +281,12 @@ pub(crate) enum RunResult {
 /// value from the coroutine type as well as to abstract over futures and
 /// synchronous closures. Bundling all the required operations into this trait
 /// also allows us to minimize the number of heap allocations per task.
-trait CoroutinePoller: Send {
+trait CoroutinePoller: Send + 'static {
     fn run(&mut self, cx: &mut Context) -> RunResult;
 
     fn complete(&mut self);
+
+    fn into_any(self: Box<Self>) -> Box<dyn Any>;
 }
 
 struct ClosurePoller<F, T> {
@@ -254,7 +298,7 @@ struct ClosurePoller<F, T> {
 impl<F, T> CoroutinePoller for ClosurePoller<F, T>
 where
     F: FnOnce() -> T + Send + 'static,
-    T: Send,
+    T: Send + 'static,
 {
     fn run(&mut self, _cx: &mut Context) -> RunResult {
         let closure = self
@@ -280,6 +324,10 @@ where
             };
         }
     }
+
+    fn into_any(self: Box<Self>) -> Box<dyn Any> {
+        self
+    }
 }
 
 struct FuturePoller<F, T> {
@@ -291,7 +339,7 @@ struct FuturePoller<F, T> {
 impl<F, T> CoroutinePoller for FuturePoller<F, T>
 where
     F: Future<Output = T> + Send + 'static,
-    T: Send,
+    T: Send + 'static,
 {
     fn run(&mut self, cx: &mut Context) -> RunResult {
         // Safety: This struct is only ever used inside a box, so we know that
@@ -323,5 +371,9 @@ where
                 waker.wake_by_ref();
             };
         }
+    }
+
+    fn into_any(self: Box<Self>) -> Box<dyn Any> {
+        self
     }
 }

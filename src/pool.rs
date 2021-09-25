@@ -14,11 +14,14 @@ use core_affinity::CoreId;
 use crossbeam_channel::{bounded, unbounded, Receiver, Sender};
 
 use crate::{
+    error::PoolFullError,
     task::{Coroutine, Task},
     worker::{Listener, Worker},
 };
 
 /// A value describing a size constraint for a thread pool.
+///
+/// See [`Builder::size`] for details.
 pub trait SizeConstraint {
     /// Get the minimum number of threads to be in the thread pool.
     fn min(&self) -> usize;
@@ -59,7 +62,7 @@ impl SizeConstraint for RangeTo<usize> {
 
 /// A builder for constructing a customized thread pool.
 #[derive(Debug)]
-pub struct ThreadPoolBuilder {
+pub struct Builder {
     name: Option<String>,
     size: Option<(usize, usize)>,
     stack_size: Option<usize>,
@@ -68,7 +71,7 @@ pub struct ThreadPoolBuilder {
     idle_timeout: Duration,
 }
 
-impl Default for ThreadPoolBuilder {
+impl Default for Builder {
     fn default() -> Self {
         Self {
             name: None,
@@ -81,7 +84,7 @@ impl Default for ThreadPoolBuilder {
     }
 }
 
-impl ThreadPoolBuilder {
+impl Builder {
     /// Set a custom thread name for threads spawned by this thread pool.
     ///
     /// # Panics
@@ -249,7 +252,7 @@ impl ThreadPoolBuilder {
 /// Dropping the thread pool will prevent any further tasks from being scheduled
 /// on the pool and detaches all threads in the pool. If you want to block until
 /// all pending tasks have completed and the pool is entirely shut down, then
-/// use [`ThreadPool::join`].
+/// use one of the available [`join`](ThreadPool::join) methods.
 pub struct ThreadPool {
     thread_name: Option<String>,
     stack_size: Option<usize>,
@@ -267,17 +270,6 @@ impl Default for ThreadPool {
 }
 
 impl ThreadPool {
-    /// Get a shared reference to a common, shared thread pool for the current
-    /// process.
-    #[cfg(feature = "common")]
-    pub fn common() -> &'static Self {
-        use once_cell::sync::OnceCell;
-
-        static COMMON: OnceCell<ThreadPool> = OnceCell::new();
-
-        COMMON.get_or_init(Self::default)
-    }
-
     /// Create a new thread pool with the default configuration.
     #[inline]
     pub fn new() -> Self {
@@ -286,8 +278,8 @@ impl ThreadPool {
 
     /// Get a builder for creating a customized thread pool.
     #[inline]
-    pub fn builder() -> ThreadPoolBuilder {
-        ThreadPoolBuilder::default()
+    pub fn builder() -> Builder {
+        Builder::default()
     }
 
     /// Get the number of threads currently running in the thread pool.
@@ -298,7 +290,7 @@ impl ThreadPool {
     /// Get the number of tasks queued for execution, but not yet started.
     ///
     /// This number will always be less than or equal to the configured
-    /// [`queue_limit`][ThreadPoolBuilder::queue_limit], if any.
+    /// [`queue_limit`][Builder::queue_limit], if any.
     pub fn queued_tasks(&self) -> usize {
         self.queue.0.len()
     }
@@ -328,6 +320,16 @@ impl ThreadPool {
     /// maximum number of threads, the task will be enqueued. If the queue is
     /// configured with a limit, this call will block until space becomes
     /// available in the queue.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let pool = threadfin::ThreadPool::new();
+    ///
+    /// let result = pool.execute(|| 2 + 2).join();
+    ///
+    /// assert_eq!(result, 4);
+    /// ```
     pub fn execute<T, F>(&self, closure: F) -> Task<T>
     where
         T: Send + 'static,
@@ -353,30 +355,56 @@ impl ThreadPool {
         task
     }
 
-    /// Execute a closure on the thread pool without blocking.
+    /// Attempts to execute a closure on the thread pool without blocking.
     ///
-    /// If the task queue is full, the task is rejected and `None` is returned.
-    pub fn try_execute<T, F>(&self, closure: F) -> Option<Task<T>>
+    /// If the pool is at its max thread count and the task queue is full, the
+    /// task is rejected and an error is returned. The original closure can be
+    /// extracted from the error.
+    ///
+    /// # Examples
+    ///
+    /// One use for this method is implementing backpressure by executing a
+    /// closure on the current thread if a pool is currently full.
+    ///
+    /// ```
+    /// let pool = threadfin::ThreadPool::new();
+    ///
+    /// // Try to run a closure in the thread pool.
+    /// let result = pool.try_execute(|| 2 + 2)
+    ///     // If successfully submitted, block until the task completes.
+    ///     .map(|task| task.join())
+    ///     // If the pool was full, invoke the closure here and now.
+    ///     .unwrap_or_else(|error| error.into_inner()());
+    ///
+    /// assert_eq!(result, 4);
+    /// ```
+    pub fn try_execute<T, F>(&self, closure: F) -> Result<Task<T>, PoolFullError<F>>
     where
         T: Send + 'static,
         F: FnOnce() -> T + Send + 'static,
     {
         let (task, coroutine) = Task::from_closure(closure);
 
-        self.try_execute_coroutine(coroutine).ok().map(|_| task)
+        self.try_execute_coroutine(coroutine)
+            .map(|_| task)
+            .map_err(|coroutine| PoolFullError(coroutine.into_inner_closure()))
     }
 
     /// Execute a future on the thread pool.
     ///
-    /// If the task queue is full, the task is rejected and `None` is returned.
-    pub fn try_execute_future<T, F>(&self, future: F) -> Option<Task<T>>
+    /// If the pool is at its max thread count and the task queue is full, the
+    /// task is rejected and an error is returned. The original future can be
+    /// extracted from the error.
+    pub fn try_execute_future<T, F>(&self, future: F) -> Result<Task<T>, PoolFullError<F>>
     where
         T: Send + 'static,
         F: Future<Output = T> + Send + 'static,
     {
         let (task, coroutine) = Task::from_future(future);
 
-        self.try_execute_coroutine(coroutine).ok().map(|_| task)
+        self.try_execute_coroutine(coroutine)
+            .map(|_| task)
+            .map_err(|coroutine| PoolFullError(coroutine.into_inner_future()))
     }
 
     fn execute_coroutine(&self, coroutine: Coroutine) {
