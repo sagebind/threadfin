@@ -1,7 +1,7 @@
 use std::{panic::catch_unwind, thread, time::Duration};
 
 use futures_timer::Delay;
-use skipper::ThreadPool;
+use threadfin::ThreadPool;
 
 fn single_thread() -> ThreadPool {
     ThreadPool::builder().size(0..1).build()
