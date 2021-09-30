@@ -279,10 +279,50 @@ impl Builder {
 
 /// A thread pool for running multiple tasks on a configurable group of threads.
 ///
+/// Thread pools can improve performance when executing a large number of
+/// concurrent tasks since the expensive overhead of spawning threads is
+/// minimized as threads are re-used for multiple tasks. Thread pools are also
+/// useful for controlling and limiting parallelism.
+///
 /// Dropping the thread pool will prevent any further tasks from being scheduled
 /// on the pool and detaches all threads in the pool. If you want to block until
 /// all pending tasks have completed and the pool is entirely shut down, then
 /// use one of the available [`join`](ThreadPool::join) methods.
+///
+/// # Pool size
+///
+/// Every thread pool has a minimum and maximum number of worker threads that it
+/// will spawn for executing tasks. This range is known as the _pool size_, and
+/// affects pool behavior in the following ways:
+///
+/// - **Minimum size**: A guaranteed number of threads that will always be
+///   created and maintained by the thread pool. Threads will be eagerly created
+///   to meet this minimum size when the pool is created, and at least this many
+///   threads will be kept running in the pool until the pool is shut down.
+/// - **Maximum size**: A limit on the number of additional threads to spawn to
+///   execute more work.
+///
+/// # Queueing
+///
+/// If a new or existing worker thread is unable to immediately start processing
+/// a submitted task, that task will be placed in a queue for worker threads to
+/// take from when they complete their current tasks. Queueing is only used when
+/// it is not possible to directly handoff a task to an existing thread and
+/// spawning a new thread would exceed the pool's configured maximum size.
+///
+/// By default, thread pools are configured to use an _unbounded_ queue which
+/// can hold an unlimited number of pending tasks. This is a sensible default,
+/// but is not desirable in all use-cases and can be changed with
+/// [`Builder::queue_limit`].
+///
+/// # Monitoring
+///
+/// Each pool instance provides methods for gathering various statistics on the
+/// pool's usage, such as number of current number of threads, tasks completed
+/// over time, and queued tasks. While these methods provide the most up-to-date
+/// numbers upon invocation, they should not be used for controlling program
+/// behavior since they can become immediately outdated due to the live nature
+/// of the pool.
 pub struct ThreadPool {
     thread_name: Option<String>,
     stack_size: Option<usize>,
@@ -301,6 +341,9 @@ impl Default for ThreadPool {
 
 impl ThreadPool {
     /// Create a new thread pool with the default configuration.
+    ///
+    /// If you'd like to customize the thread pool's behavior then use
+    /// [`ThreadPool::builder`].
     #[inline]
     pub fn new() -> Self {
         Self::builder().build()
@@ -320,27 +363,132 @@ impl ThreadPool {
     /// Get the number of tasks queued for execution, but not yet started.
     ///
     /// This number will always be less than or equal to the configured
-    /// [`queue_limit`][Builder::queue_limit], if any.
+    /// [`queue_limit`](Builder::queue_limit), if any.
+    ///
+    /// Note that the number returned may become immediately outdated after
+    /// invocation.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::{thread::sleep, time::Duration};
+    ///
+    /// // Create a pool with just one thread.
+    /// let pool = threadfin::ThreadPool::builder().size(1).build();
+    ///
+    /// // Nothing is queued yet.
+    /// assert_eq!(pool.queued_tasks(), 0);
+    ///
+    /// // Start a slow task.
+    /// let task = pool.execute(|| {
+    ///     sleep(Duration::from_millis(100));
+    /// });
+    ///
+    /// // Wait a little for the task to start.
+    /// sleep(Duration::from_millis(10));
+    /// assert_eq!(pool.queued_tasks(), 0);
+    ///
+    /// // Enqueue some more tasks.
+    /// let count = 4;
+    /// for _ in 0..count {
+    ///     pool.execute(|| {
+    ///         // work to do
+    ///     });
+    /// }
+    ///
+    /// // The tasks should still be in the queue because the slow task is
+    /// // running on the only thread.
+    /// assert_eq!(pool.queued_tasks(), count);
+    /// # pool.join();
+    /// ```
+    #[inline]
     pub fn queued_tasks(&self) -> usize {
         self.queue.0.len()
     }
 
     /// Get the number of tasks currently running.
+    ///
+    /// Note that the number returned may become immediately outdated after
+    /// invocation.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::{thread::sleep, time::Duration};
+    ///
+    /// let pool = threadfin::ThreadPool::new();
+    ///
+    /// // Nothing is running yet.
+    /// assert_eq!(pool.running_tasks(), 0);
+    ///
+    /// // Start a task.
+    /// let task = pool.execute(|| {
+    ///     sleep(Duration::from_millis(100));
+    /// });
+    ///
+    /// // Wait a little for the task to start.
+    /// sleep(Duration::from_millis(10));
+    /// assert_eq!(pool.running_tasks(), 1);
+    ///
+    /// // Wait for the task to complete.
+    /// task.join();
+    /// assert_eq!(pool.running_tasks(), 0);
+    /// ```
+    #[inline]
     pub fn running_tasks(&self) -> usize {
-        self.shared.running_tasks_count.load(Ordering::SeqCst)
+        self.shared.running_tasks_count.load(Ordering::Release)
     }
 
-    /// Get the number of tasks completed (successfully or otherwise) by this pool since it was created.
+    /// Get the number of tasks completed (successfully or otherwise) by this
+    /// pool since it was created.
+    ///
+    /// Note that the number returned may become immediately outdated after
+    /// invocation.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let pool = threadfin::ThreadPool::new();
+    /// assert_eq!(pool.completed_tasks(), 0);
+    ///
+    /// pool.execute(|| 2 + 2).join();
+    /// assert_eq!(pool.completed_tasks(), 1);
+    ///
+    /// pool.execute(|| 2 + 2).join();
+    /// assert_eq!(pool.completed_tasks(), 2);
+    /// ```
+    #[inline]
     pub fn completed_tasks(&self) -> u64 {
-        self.shared.completed_tasks_count.load(Ordering::SeqCst)
+        self.shared.completed_tasks_count.load(Ordering::Release)
     }
 
     /// Get the number of tasks that have panicked since the pool was created.
+    ///
+    /// Note that the number returned may become immediately outdated after
+    /// invocation.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::{thread::sleep, time::Duration};
+    ///
+    /// let pool = threadfin::ThreadPool::new();
+    /// assert_eq!(pool.panicked_tasks(), 0);
+    ///
+    /// pool.execute(|| {
+    ///     panic!("this task panics");
+    /// });
+    ///
+    /// sleep(Duration::from_millis(10));
+    ///
+    /// assert_eq!(pool.panicked_tasks(), 1);
+    /// ```
+    #[inline]
     pub fn panicked_tasks(&self) -> u64 {
-        self.shared.panicked_tasks_count.load(Ordering::SeqCst)
+        self.shared.panicked_tasks_count.load(Ordering::Release)
     }
 
-    /// Submit a task to be executed.
+    /// Submit a closure to be executed by the thread pool.
     ///
     /// If all worker threads are busy, but there are less threads than the
     /// configured maximum, an additional thread will be created and added to
@@ -355,10 +503,15 @@ impl ThreadPool {
     ///
     /// ```
     /// let pool = threadfin::ThreadPool::new();
+    /// let task = pool.execute(|| {
+    ///     2 + 2 // some expensive computation
+    /// });
     ///
-    /// let result = pool.execute(|| 2 + 2).join();
+    /// // do something in the meantime
     ///
-    /// assert_eq!(result, 4);
+    /// // now wait for the result
+    /// let sum = task.join();
+    /// assert_eq!(sum, 4);
     /// ```
     pub fn execute<T, F>(&self, closure: F) -> Task<T>
     where
@@ -372,7 +525,29 @@ impl ThreadPool {
         task
     }
 
-    /// Execute a future on the thread pool.
+    /// Submit a future to be executed by the thread pool.
+    ///
+    /// If all worker threads are busy, but there are less threads than the
+    /// configured maximum, an additional thread will be created and added to
+    /// the pool to execute this task.
+    ///
+    /// If all worker threads are busy and the pool has reached the configured
+    /// maximum number of threads, the task will be enqueued. If the queue is
+    /// configured with a limit, this call will block until space becomes
+    /// available in the queue.
+    ///
+    /// ```
+    /// let pool = threadfin::ThreadPool::new();
+    /// let task = pool.execute_future(async {
+    ///     2 + 2 // some asynchronous code
+    /// });
+    ///
+    /// // do something in the meantime
+    ///
+    /// // now wait for the result
+    /// let sum = task.join();
+    /// assert_eq!(sum, 4);
+    /// ```
     pub fn execute_future<T, F>(&self, future: F) -> Task<T>
     where
         T: Send + 'static,
@@ -420,7 +595,7 @@ impl ThreadPool {
             .map_err(|coroutine| PoolFullError(coroutine.into_inner_closure()))
     }
 
-    /// Execute a future on the thread pool.
+    /// Attempts to execute a future on the thread pool without blocking.
     ///
     /// If the pool is at its max thread count and the task queue is full, the
     /// task is rejected and an error is returned. The original future can be
@@ -439,6 +614,8 @@ impl ThreadPool {
 
     fn execute_coroutine(&self, coroutine: Coroutine) {
         if let Err(coroutine) = self.try_execute_coroutine(coroutine) {
+            // Cannot fail because we hold a reference to both the channel
+            // sender and receiver and it cannot be closed here.
             self.queue.0.send(coroutine).unwrap();
         }
     }
@@ -530,21 +707,21 @@ impl ThreadPool {
             fn on_task_started(&mut self) {
                 self.shared
                     .running_tasks_count
-                    .fetch_add(1, Ordering::SeqCst);
+                    .fetch_add(1, Ordering::Acquire);
             }
 
             fn on_task_completed(&mut self, panicked: bool) {
                 self.shared
                     .running_tasks_count
-                    .fetch_sub(1, Ordering::SeqCst);
+                    .fetch_sub(1, Ordering::Acquire);
                 self.shared
                     .completed_tasks_count
-                    .fetch_add(1, Ordering::SeqCst);
+                    .fetch_add(1, Ordering::Acquire);
 
                 if panicked {
                     self.shared
                         .panicked_tasks_count
-                        .fetch_add(1, Ordering::SeqCst);
+                        .fetch_add(1, Ordering::Acquire);
                 }
             }
 

@@ -27,6 +27,58 @@ use std::{
 ///
 /// # Examples
 ///
+/// Creating a task:
+///
+/// ```
+/// use threadfin::ThreadPool;
+///
+/// let pool = ThreadPool::new();
+///
+/// let task = pool.execute(|| {
+///     // do some work
+/// });
+/// ```
+///
+/// Blocking on a task:
+///
+/// ```
+/// use threadfin::ThreadPool;
+///
+/// let pool = ThreadPool::new();
+///
+/// let task = pool.execute(|| {
+///     // some expensive computation
+///     2 + 2
+/// });
+///
+/// // do something in the meantime
+///
+/// // now block on the result
+/// let sum = task.join();
+/// assert_eq!(sum, 4);
+/// ```
+///
+/// Awaiting a task asynchronously:
+///
+/// ```
+/// # threadfin::common_pool().execute_future(async {
+/// use threadfin::ThreadPool;
+///
+/// let pool = ThreadPool::new();
+///
+/// let task = pool.execute(|| {
+///     // some expensive, synchronous computation
+///     2 + 2
+/// });
+///
+/// // do something in the meantime
+///
+/// // now await on the result
+/// let sum = task.await;
+/// assert_eq!(sum, 4);
+/// # }).join();
+/// ```
+///
 /// Detaching a task:
 ///
 /// ```

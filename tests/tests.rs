@@ -190,18 +190,6 @@ fn idle_shutdown() {
 }
 
 #[test]
-fn tasks_completed() {
-    let pool = ThreadPool::default();
-    assert_eq!(pool.completed_tasks(), 0);
-
-    pool.execute(|| 2 + 2).join();
-    assert_eq!(pool.completed_tasks(), 1);
-
-    pool.execute(|| 2 + 2).join();
-    assert_eq!(pool.completed_tasks(), 2);
-}
-
-#[test]
 fn join() {
     // Just a dumb test to make sure join doesn't do anything strange.
     ThreadPool::default().join();

@@ -10,6 +10,10 @@ Extra features:
 - Optional common process-wide thread pool
 - CPU core pinning
 
+## Async support
+
+Threadfin supports asynchronous usage via futures, and allows you to mix and match both synchronous and asynchronous code with a single thread pool.
+
 ## Examples
 
 ```rust
