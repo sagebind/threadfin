@@ -8,7 +8,7 @@ mod worker;
 
 pub use crate::{
     error::PoolFullError,
-    pool::{Builder, SizeConstraint, ThreadPool},
+    pool::{Builder, PerCore, SizeConstraint, ThreadPool},
     task::Task,
 };
 

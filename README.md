@@ -8,7 +8,6 @@ Extra features:
 - Support for async tasks
 - Tasks return a handle which can be joined or awaited for the return value
 - Optional common process-wide thread pool
-- CPU core pinning
 
 ## Async support
 

@@ -3,7 +3,7 @@
 use std::{
     fmt,
     future::Future,
-    ops::{Range, RangeTo},
+    ops::{Range, RangeTo, RangeToInclusive},
     sync::{
         atomic::{AtomicU64, AtomicUsize, Ordering},
         Arc, Condvar, Mutex,
@@ -12,8 +12,8 @@ use std::{
     time::{Duration, Instant},
 };
 
-use core_affinity::CoreId;
 use crossbeam_channel::{bounded, unbounded, Receiver, Sender};
+use once_cell::sync::Lazy;
 
 use crate::{
     error::PoolFullError,
@@ -59,6 +59,63 @@ impl SizeConstraint for RangeTo<usize> {
 
     fn max(&self) -> usize {
         self.end
+    }
+}
+
+impl SizeConstraint for RangeToInclusive<usize> {
+    fn min(&self) -> usize {
+        0
+    }
+
+    fn max(&self) -> usize {
+        self.end
+    }
+}
+
+/// Modifies a size constraint to be per available CPU core.
+///
+/// # Examples
+///
+/// ```
+/// # use threadfin::PerCore;
+/// // one thread per core
+/// let size = PerCore::new(1);
+///
+/// // four threads per core
+/// let size = PerCore::new(4);
+///
+/// // at least 1 thread per core and at most 2 threads per core
+/// let size = PerCore::new(1..2);
+/// ```
+pub struct PerCore<T> {
+    inner: T,
+    core_count: usize,
+}
+
+impl<T> PerCore<T> {
+    pub fn new(inner: T) -> Self {
+        static CORE_COUNT: Lazy<usize> = Lazy::new(|| num_cpus::get().max(1));
+
+        Self {
+            inner,
+            core_count: *CORE_COUNT,
+        }
+    }
+}
+
+impl<T> From<T> for PerCore<T> {
+    fn from(size: T) -> Self {
+        Self::new(size)
+    }
+}
+
+impl<T: SizeConstraint> SizeConstraint for PerCore<T> {
+    fn min(&self) -> usize {
+        self.core_count * self.inner.min()
+    }
+
+    fn max(&self) -> usize {
+        self.core_count * self.inner.max()
     }
 }
 
@@ -235,16 +292,10 @@ impl Builder {
     /// Create a thread pool according to the configuration set with this
     /// builder.
     pub fn build(self) -> ThreadPool {
-        let core_ids = core_affinity::get_core_ids();
-
         let size = self.size.unwrap_or_else(|| {
-            let cpus = core_ids
-                .as_ref()
-                .filter(|v| !v.is_empty())
-                .map(Vec::len)
-                .unwrap_or(1);
+            let size = PerCore::new(1..2);
 
-            (cpus, cpus * 2)
+            (size.min(), size.max())
         });
 
         let shared = Shared {
@@ -264,7 +315,6 @@ impl Builder {
             concurrency_limit: self.worker_concurrency_limit,
             queue: self.queue_limit.map(bounded).unwrap_or_else(unbounded),
             immediate_queue: bounded(0),
-            core_ids,
             shared: Arc::new(shared),
         };
 
@@ -329,7 +379,6 @@ pub struct ThreadPool {
     concurrency_limit: usize,
     queue: (Sender<Coroutine>, Receiver<Coroutine>),
     immediate_queue: (Sender<Coroutine>, Receiver<Coroutine>),
-    core_ids: Option<Vec<CoreId>>,
     shared: Arc<Shared>,
 }
 
@@ -436,7 +485,7 @@ impl ThreadPool {
     /// ```
     #[inline]
     pub fn running_tasks(&self) -> usize {
-        self.shared.running_tasks_count.load(Ordering::Release)
+        self.shared.running_tasks_count.load(Ordering::Relaxed)
     }
 
     /// Get the number of tasks completed (successfully or otherwise) by this
@@ -459,7 +508,7 @@ impl ThreadPool {
     /// ```
     #[inline]
     pub fn completed_tasks(&self) -> u64 {
-        self.shared.completed_tasks_count.load(Ordering::Release)
+        self.shared.completed_tasks_count.load(Ordering::Relaxed)
     }
 
     /// Get the number of tasks that have panicked since the pool was created.
@@ -485,7 +534,7 @@ impl ThreadPool {
     /// ```
     #[inline]
     pub fn panicked_tasks(&self) -> u64 {
-        self.shared.panicked_tasks_count.load(Ordering::Release)
+        self.shared.panicked_tasks_count.load(Ordering::Relaxed)
     }
 
     /// Submit a closure to be executed by the thread pool.
@@ -535,6 +584,13 @@ impl ThreadPool {
     /// maximum number of threads, the task will be enqueued. If the queue is
     /// configured with a limit, this call will block until space becomes
     /// available in the queue.
+    ///
+    /// # Thread locality
+    ///
+    /// While the given future must implement [`Send`] to be moved into a thread
+    /// in the pool to be processed, once the future is assigned a thread it
+    /// will stay assigned to that single thread until completion. This improves
+    /// cache locality even across `.await` points in the future.
     ///
     /// ```
     /// let pool = threadfin::ThreadPool::new();
@@ -707,21 +763,21 @@ impl ThreadPool {
             fn on_task_started(&mut self) {
                 self.shared
                     .running_tasks_count
-                    .fetch_add(1, Ordering::Acquire);
+                    .fetch_add(1, Ordering::Relaxed);
             }
 
             fn on_task_completed(&mut self, panicked: bool) {
                 self.shared
                     .running_tasks_count
-                    .fetch_sub(1, Ordering::Acquire);
+                    .fetch_sub(1, Ordering::Relaxed);
                 self.shared
                     .completed_tasks_count
-                    .fetch_add(1, Ordering::Acquire);
+                    .fetch_add(1, Ordering::Relaxed);
 
                 if panicked {
                     self.shared
                         .panicked_tasks_count
-                        .fetch_add(1, Ordering::Acquire);
+                        .fetch_add(1, Ordering::Relaxed);
                 }
             }
 
@@ -761,21 +817,6 @@ impl ThreadPool {
             builder = builder.stack_size(size);
         }
 
-        let mut core_id = None;
-
-        // Select the core to pin this worker to in a deterministic round-robin
-        // fashion. For example, if the system has 2 CPU cores, threads 0, 2, 4,
-        // etc will be pinned to core 0, and threads 1, 3, 5, etc will be pinned
-        // to core 1.
-        //
-        // We only do this if the min number of threads is at least as large as
-        // the number of cores.
-        if let Some(core_ids) = self.core_ids.as_ref() {
-            if !core_ids.is_empty() && self.shared.min_threads >= core_ids.len() {
-                core_id = Some(core_ids[*thread_count % core_ids.len()]);
-            }
-        }
-
         *thread_count += 1;
 
         let worker = Worker::new(
@@ -793,15 +834,7 @@ impl ThreadPool {
         // will decrement the count again if it is dropped.
         drop(thread_count);
 
-        builder
-            .spawn(move || {
-                if let Some(core_id) = core_id {
-                    core_affinity::set_for_current(core_id);
-                }
-
-                worker.run();
-            })
-            .unwrap();
+        builder.spawn(move || worker.run()).unwrap();
 
         Ok(())
     }
