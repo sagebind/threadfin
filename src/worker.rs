@@ -17,7 +17,7 @@ pub(crate) trait Listener {
 
 /// A worker thread which belongs to a thread pool and executes tasks.
 pub(crate) struct Worker<L: Listener> {
-    idle_timeout: Duration,
+    keep_alive: Duration,
 
     concurrency_limit: usize,
 
@@ -50,11 +50,11 @@ impl<L: Listener> Worker<L> {
         queue: Receiver<Coroutine>,
         immediate_queue: Receiver<Coroutine>,
         concurrency_limit: usize,
-        idle_timeout: Duration,
+        keep_alive: Duration,
         listener: L,
     ) -> Self {
         Self {
-            idle_timeout,
+            keep_alive,
             concurrency_limit,
             initial_task,
             pending_tasks: HashMap::new(),
@@ -115,7 +115,7 @@ impl<L: Listener> Worker<L> {
             wake_id = Some(select.recv(&self.wake_notifications.1));
         }
 
-        match select.select_timeout(self.idle_timeout) {
+        match select.select_timeout(self.keep_alive) {
             Ok(op) if Some(op.index()) == queue_id => {
                 if let Ok(coroutine) = op.recv(&self.queue) {
                     PollResult::Work(coroutine)

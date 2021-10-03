@@ -1,16 +1,9 @@
 //! Implementation of the thread pool itself.
 
-use std::{
-    fmt,
-    future::Future,
-    ops::{Range, RangeTo, RangeToInclusive},
-    sync::{
+use std::{fmt, future::Future, ops::{Range, RangeInclusive, RangeTo, RangeToInclusive}, sync::{
         atomic::{AtomicU64, AtomicUsize, Ordering},
         Arc, Condvar, Mutex,
-    },
-    thread,
-    time::{Duration, Instant},
-};
+    }, thread, time::{Duration, Instant}};
 
 use crossbeam_channel::{bounded, unbounded, Receiver, Sender};
 use once_cell::sync::Lazy;
@@ -22,6 +15,9 @@ use crate::{
 };
 
 /// A value describing a size constraint for a thread pool.
+///
+/// Any size constraint can be wrapped in [`PerCore`] to be made relative to the
+/// number of available CPU cores on the current system.
 ///
 /// See [`Builder::size`] for details.
 pub trait SizeConstraint {
@@ -52,6 +48,16 @@ impl SizeConstraint for Range<usize> {
     }
 }
 
+impl SizeConstraint for RangeInclusive<usize> {
+    fn min(&self) -> usize {
+        *self.start()
+    }
+
+    fn max(&self) -> usize {
+        *self.end()
+    }
+}
+
 impl SizeConstraint for RangeTo<usize> {
     fn min(&self) -> usize {
         0
@@ -79,43 +85,31 @@ impl SizeConstraint for RangeToInclusive<usize> {
 /// ```
 /// # use threadfin::PerCore;
 /// // one thread per core
-/// let size = PerCore::new(1);
+/// let size = PerCore(1);
 ///
 /// // four threads per core
-/// let size = PerCore::new(4);
+/// let size = PerCore(4);
 ///
 /// // at least 1 thread per core and at most 2 threads per core
-/// let size = PerCore::new(1..2);
+/// let size = PerCore(1..2);
 /// ```
-pub struct PerCore<T> {
-    inner: T,
-    core_count: usize,
-}
+pub struct PerCore<T>(pub T);
 
-impl<T> PerCore<T> {
-    pub fn new(inner: T) -> Self {
-        static CORE_COUNT: Lazy<usize> = Lazy::new(|| num_cpus::get().max(1));
-
-        Self {
-            inner,
-            core_count: *CORE_COUNT,
-        }
-    }
-}
+static CORE_COUNT: Lazy<usize> = Lazy::new(|| num_cpus::get().max(1));
 
 impl<T> From<T> for PerCore<T> {
     fn from(size: T) -> Self {
-        Self::new(size)
+        Self(size)
     }
 }
 
 impl<T: SizeConstraint> SizeConstraint for PerCore<T> {
     fn min(&self) -> usize {
-        self.core_count * self.inner.min()
+        *CORE_COUNT * self.0.min()
     }
 
     fn max(&self) -> usize {
-        self.core_count * self.inner.max()
+        *CORE_COUNT * self.0.max()
     }
 }
 
@@ -124,7 +118,7 @@ impl<T: SizeConstraint> SizeConstraint for PerCore<T> {
 /// # Examples
 ///
 /// ```
-/// let custom_pool = threadfin::ThreadPool::builder()
+/// let custom_pool = threadfin::builder()
 ///     .name("my-pool")
 ///     .size(2)
 ///     .build();
@@ -136,7 +130,7 @@ pub struct Builder {
     stack_size: Option<usize>,
     queue_limit: Option<usize>,
     worker_concurrency_limit: usize,
-    idle_timeout: Duration,
+    keep_alive: Duration,
 }
 
 impl Default for Builder {
@@ -147,7 +141,7 @@ impl Default for Builder {
             stack_size: None,
             queue_limit: None,
             worker_concurrency_limit: 16,
-            idle_timeout: Duration::from_secs(60),
+            keep_alive: Duration::from_secs(60),
         }
     }
 }
@@ -162,7 +156,7 @@ impl Builder {
     /// # Examples
     ///
     /// ```
-    /// let pool = threadfin::ThreadPool::builder().name("my-pool").build();
+    /// let pool = threadfin::builder().name("my-pool").build();
     /// ```
     pub fn name<T: Into<String>>(mut self, name: T) -> Self {
         let name = name.into();
@@ -182,6 +176,9 @@ impl Builder {
     /// the upper bound will be a maximum pool size the pool is allowed to burst
     /// up to when the core threads are busy.
     ///
+    /// Any size constraint can be wrapped in [`PerCore`] to be made relative to
+    /// the number of available CPU cores on the current system.
+    ///
     /// If not set, a reasonable size will be selected based on the number of
     /// CPU cores on the current system.
     ///
@@ -189,18 +186,23 @@ impl Builder {
     ///
     /// ```
     /// // Create a thread pool with exactly 2 threads.
-    /// # use threadfin::ThreadPool;
-    /// let pool = ThreadPool::builder().size(2).build();
+    /// let pool = threadfin::builder().size(2).build();
     /// ```
     ///
     /// ```
     /// // Create a thread pool with no idle threads, but will spawn up to 4
     /// // threads lazily when there's work to be done.
-    /// # use threadfin::ThreadPool;
-    /// let pool = ThreadPool::builder().size(0..4).build();
+    /// let pool = threadfin::builder().size(0..4).build();
     ///
     /// // Or equivalently:
-    /// let pool = ThreadPool::builder().size(..4).build();
+    /// let pool = threadfin::builder().size(..4).build();
+    /// ```
+    ///
+    /// ```
+    /// use threadfin::PerCore;
+    ///
+    /// // Create a thread pool with two threads per core.
+    /// let pool = threadfin::builder().size(PerCore(2)).build();
     /// ```
     ///
     /// # Panics
@@ -234,10 +236,8 @@ impl Builder {
     /// # Examples
     ///
     /// ```
-    /// use threadfin::ThreadPool;
-    ///
     /// // Worker threads will have a stack size of at least 32 KiB.
-    /// let pool = ThreadPool::builder().stack_size(32 * 1024).build();
+    /// let pool = threadfin::builder().stack_size(32 * 1024).build();
     /// ```
     pub fn stack_size(mut self, size: usize) -> Self {
         self.stack_size = Some(size);
@@ -258,13 +258,13 @@ impl Builder {
         self
     }
 
-    /// Set a timeout for idle worker threads.
+    /// Set a duration for how long to keep idle worker threads alive.
     ///
     /// If the pool has more than the minimum configured number of threads and
     /// threads remain idle for more than this duration, they will be terminated
     /// until the minimum thread count is reached.
-    pub fn idle_timeout(mut self, timeout: Duration) -> Self {
-        self.idle_timeout = timeout;
+    pub fn keep_alive(mut self, duration: Duration) -> Self {
+        self.keep_alive = duration;
         self
     }
 
@@ -293,7 +293,7 @@ impl Builder {
     /// builder.
     pub fn build(self) -> ThreadPool {
         let size = self.size.unwrap_or_else(|| {
-            let size = PerCore::new(1..2);
+            let size = PerCore(1..2);
 
             (size.min(), size.max())
         });
@@ -305,7 +305,7 @@ impl Builder {
             running_tasks_count: Default::default(),
             completed_tasks_count: Default::default(),
             panicked_tasks_count: Default::default(),
-            idle_timeout: self.idle_timeout,
+            keep_alive: self.keep_alive,
             shutdown_cvar: Condvar::new(),
         };
 
@@ -423,7 +423,7 @@ impl ThreadPool {
     /// use std::{thread::sleep, time::Duration};
     ///
     /// // Create a pool with just one thread.
-    /// let pool = threadfin::ThreadPool::builder().size(1).build();
+    /// let pool = threadfin::builder().size(1).build();
     ///
     /// // Nothing is queued yet.
     /// assert_eq!(pool.queued_tasks(), 0);
@@ -824,7 +824,7 @@ impl ThreadPool {
             self.queue.1.clone(),
             self.immediate_queue.1.clone(),
             self.concurrency_limit,
-            self.shared.idle_timeout,
+            self.shared.keep_alive,
             WorkerListener {
                 shared: self.shared.clone(),
             },
@@ -858,6 +858,6 @@ struct Shared {
     running_tasks_count: AtomicUsize,
     completed_tasks_count: AtomicU64,
     panicked_tasks_count: AtomicU64,
-    idle_timeout: Duration,
+    keep_alive: Duration,
     shutdown_cvar: Condvar,
 }

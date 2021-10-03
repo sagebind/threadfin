@@ -16,9 +16,7 @@ Threadfin supports asynchronous usage via futures, and allows you to mix and mat
 ## Examples
 
 ```rust
-use threadfin::ThreadPool;
-
-let pool = ThreadPool::builder().size(8).build();
+let pool = threadfin::builder().size(8).build();
 ```
 
 ## Other libraries

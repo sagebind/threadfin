@@ -61,7 +61,7 @@ use std::{
 /// Awaiting a task asynchronously:
 ///
 /// ```
-/// # threadfin::common_pool().execute_future(async {
+/// # threadfin::common().execute_future(async {
 /// use threadfin::ThreadPool;
 ///
 /// let pool = ThreadPool::new();

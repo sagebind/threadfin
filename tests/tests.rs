@@ -174,7 +174,7 @@ fn thread_count() {
 fn idle_shutdown() {
     let pool = ThreadPool::builder()
         .size(0..1)
-        .idle_timeout(Duration::from_millis(100))
+        .keep_alive(Duration::from_millis(100))
         .build();
     assert_eq!(pool.threads(), 0, "pool starts out empty");
 
@@ -207,4 +207,11 @@ fn join_timeout_expiring() {
     // Joining should time out since there's one task still running longer
     // than our join timeout.
     assert!(!pool.join_timeout(Duration::from_millis(10)));
+}
+
+#[test]
+fn configure_common_after_init_returns_error() {
+    threadfin::common(); // init
+
+    assert!(threadfin::configure_common(|b| b).is_err());
 }

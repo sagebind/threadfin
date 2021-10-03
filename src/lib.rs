@@ -1,5 +1,6 @@
 #![doc = include_str!("../README.md")]
 
+mod common;
 mod error;
 mod pool;
 mod task;
@@ -7,25 +8,16 @@ mod wakers;
 mod worker;
 
 pub use crate::{
-    error::PoolFullError,
+    common::*,
+    error::*,
     pool::{Builder, PerCore, SizeConstraint, ThreadPool},
     task::Task,
 };
 
-/// Get a shared reference to a common thread pool for the entire process.
+/// Get a builder for creating a customized thread pool.
 ///
-/// # Examples
-///
-/// ```
-/// let result = threadfin::common_pool().execute(|| 2 + 2).join();
-///
-/// assert_eq!(result, 4);
-/// ```
-#[cfg(feature = "common")]
-pub fn common_pool() -> &'static ThreadPool {
-    use once_cell::sync::OnceCell;
-
-    static COMMON: OnceCell<ThreadPool> = OnceCell::new();
-
-    COMMON.get_or_init(ThreadPool::default)
+/// A shorthand for [`ThreadPool::builder`].
+#[inline]
+pub fn builder() -> Builder {
+    ThreadPool::builder()
 }

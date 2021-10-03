@@ -3,14 +3,10 @@ name = "threadfin"
 version = "0.1.0"
 edition = "2018"
 
-[features]
-default = ["common"]
-common = []
-
 [dependencies]
 crossbeam-channel = "0.5"
 num_cpus = "1"
-once_cell = "1.8"
+once_cell = "1"
 
 [dev-dependencies]
 criterion = "0.3"
