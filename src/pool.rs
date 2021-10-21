@@ -1,9 +1,18 @@
 //! Implementation of the thread pool itself.
 
-use std::{fmt, future::Future, ops::{Range, RangeInclusive, RangeTo, RangeToInclusive}, sync::{
+use std::{
+    fmt,
+    future::Future,
+    ops::{Range, RangeInclusive, RangeTo, RangeToInclusive},
+    sync::{
         atomic::{AtomicU64, AtomicUsize, Ordering},
-        Arc, Condvar, Mutex,
-    }, thread, time::{Duration, Instant}};
+        Arc,
+        Condvar,
+        Mutex,
+    },
+    thread,
+    time::{Duration, Instant},
+};
 
 use crossbeam_channel::{bounded, unbounded, Receiver, Sender};
 use once_cell::sync::Lazy;

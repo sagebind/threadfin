@@ -2,6 +2,11 @@
 
 A thread pool for running multiple tasks on a configurable group of threads.
 
+[![Crates.io](https://img.shields.io/crates/v/threadfin.svg)](https://crates.io/crates/threadfin)
+[![Documentation](https://docs.rs/threadfin/badge.svg)][documentation]
+[![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Build](https://github.com/sagebind/threadfin/workflows/ci/badge.svg)](https://github.com/sagebind/threadfin/actions)
+
 Extra features:
 
 - Dynamic pool size based on load
@@ -11,7 +16,7 @@ Extra features:
 
 ## Async support
 
-Threadfin supports asynchronous usage via futures, and allows you to mix and match both synchronous and asynchronous code with a single thread pool.
+Threadfin supports asynchronous usage via futures, and allows you to mix and match both synchronous and asynchronous tasks within a single thread pool.
 
 ## Examples
 

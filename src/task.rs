@@ -269,7 +269,7 @@ impl<T> Future for Task<T> {
             Some(Err(e)) => resume_unwind(e),
             None => {
                 inner.waker = Some(cx.waker().clone());
-                return Poll::Pending;
+                Poll::Pending
             }
         }
     }
@@ -407,7 +407,9 @@ where
 
         self.result = Some(result);
 
-        RunResult::Complete { panicked }
+        RunResult::Complete {
+            panicked,
+        }
     }
 
     fn complete(&mut self) {
@@ -448,12 +450,16 @@ where
             Ok(Poll::Ready(value)) => {
                 self.result = Some(Ok(value));
 
-                RunResult::Complete { panicked: false }
+                RunResult::Complete {
+                    panicked: false,
+                }
             }
             Err(e) => {
                 self.result = Some(Err(e));
 
-                RunResult::Complete { panicked: true }
+                RunResult::Complete {
+                    panicked: true,
+                }
             }
         }
     }

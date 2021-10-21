@@ -161,7 +161,10 @@ impl<L: Listener> Worker<L> {
 
         self.listener.on_task_started();
 
-        if let RunResult::Complete { panicked } = coroutine.run() {
+        if let RunResult::Complete {
+            panicked,
+        } = coroutine.run()
+        {
             self.listener.on_task_completed(panicked);
             coroutine.complete();
         } else {
@@ -183,7 +186,10 @@ impl<L: Listener> Worker<L> {
 
     fn run_pending_by_id(&mut self, id: usize) {
         if let Some(coroutine) = self.pending_tasks.get_mut(&id) {
-            if let RunResult::Complete { panicked } = coroutine.run() {
+            if let RunResult::Complete {
+                panicked,
+            } = coroutine.run()
+            {
                 self.listener.on_task_completed(panicked);
 
                 // Task is complete, we can de-allocate it and complete it.
