@@ -35,7 +35,7 @@ let pool = threadfin::builder().size(8).build();
 
 Extra thanks to those who sponsor my open-source work:
 
-<!-- sponsors --><!-- sponsors -->
+<!-- sponsors --><a href="https://github.com/da-moon"><img src="https://github.com/da-moon.png" width="60px" alt="" /></a><!-- sponsors -->
 
 ## License
 
