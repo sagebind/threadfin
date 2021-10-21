@@ -14,6 +14,8 @@ jobs:
           token: ${{ secrets.SPONSORS_PAT }}
           minimum: 1000
           file: 'README.md'
+          template: >-
+            <a href="https://github.com/{{{ login }}}"><img src="https://github.com/{{{ login }}}.png" width="60px" alt="{{{ login }}}" /></a>
 
       - uses: stefanzweifel/git-auto-commit-action@v4
         with:

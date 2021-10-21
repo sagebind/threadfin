@@ -3,7 +3,7 @@
 A thread pool for running multiple tasks on a configurable group of threads.
 
 [![Crates.io](https://img.shields.io/crates/v/threadfin.svg)](https://crates.io/crates/threadfin)
-[![Documentation](https://docs.rs/threadfin/badge.svg)][documentation]
+[![Documentation](https://docs.rs/threadfin/badge.svg)](https://docs.rs/threadfin)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Build](https://github.com/sagebind/threadfin/workflows/ci/badge.svg)](https://github.com/sagebind/threadfin/actions)
 
@@ -33,7 +33,7 @@ let pool = threadfin::builder().size(8).build();
 
 ## Sponsors
 
-Extra thanks to those who sponsor my open-source work:
+Special thanks to sponsors of my open-source work!
 
 <!-- sponsors --><a href="https://github.com/da-moon"><img src="https://github.com/da-moon.png" width="60px" alt="" /></a><!-- sponsors -->
 
