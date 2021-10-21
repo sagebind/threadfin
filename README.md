@@ -31,6 +31,12 @@ let pool = threadfin::builder().size(8).build();
 - [rusty_pool](https://github.com/robinfriedli/rusty_pool)
 - [rayon](https://github.com/rayon-rs/rayon)
 
+## Sponsors
+
+Extra thanks to those who sponsor my open-source work:
+
+<!-- sponsors --><!-- sponsors -->
+
 ## License
 
 Licensed under the MIT license. See the [LICENSE](LICENSE) file for details.

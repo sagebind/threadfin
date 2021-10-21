@@ -1,0 +1,16 @@
+name: Update Sponsors README
+on:
+  push:
+    branches: [master]
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v2
+
+      - uses: JamesIves/github-sponsors-readme-action@1.0.5
+        with:
+          token: ${{ secrets.SPONSORS_PAT }}
+          minimum: 1000
+          file: 'README.md'
