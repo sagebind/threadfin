@@ -61,7 +61,7 @@ fn futures_that_yield_are_run_concurrently() {
     assert_eq!(pool.running_tasks(), 0);
 
     let first = pool
-        .try_execute_future(Delay::new(Duration::from_millis(100)))
+        .try_execute_future(Delay::new(Duration::from_millis(400)))
         .unwrap();
 
     // Even though there's only one worker thread, it should become idle quickly
@@ -72,7 +72,7 @@ fn futures_that_yield_are_run_concurrently() {
     assert_eq!(pool.running_tasks(), 1);
 
     let second = pool
-        .try_execute_future(Delay::new(Duration::from_millis(100)))
+        .try_execute_future(Delay::new(Duration::from_millis(200)))
         .unwrap();
 
     thread::sleep(Duration::from_millis(100));
