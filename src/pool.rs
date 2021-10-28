@@ -537,7 +537,7 @@ impl ThreadPool {
     ///     panic!("this task panics");
     /// });
     ///
-    /// sleep(Duration::from_millis(10));
+    /// sleep(Duration::from_millis(100));
     ///
     /// assert_eq!(pool.panicked_tasks(), 1);
     /// ```

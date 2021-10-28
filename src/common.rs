@@ -18,6 +18,15 @@ pub fn common() -> &'static ThreadPool {
 
 /// Configure the common thread pool.
 ///
+/// This should be done near the start of your program before any other code
+/// uses the common pool, as this function will return an error if the common
+/// pool has already been initialized.
+///
+/// Only programs should use this function! Libraries should not use this
+/// function and instead allow the running program to configure the common pool.
+/// If you need a customized pool in a library then you should use a separate
+/// pool instance.
+///
 /// # Examples
 ///
 /// ```
