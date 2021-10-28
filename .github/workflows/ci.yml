@@ -22,7 +22,7 @@ jobs:
       - uses: actions-rs/toolchain@v1
         with:
           profile: minimal
-          toolchain: "1.46.0"
+          toolchain: "1.51.0"
           default: true
 
       - run: cargo test

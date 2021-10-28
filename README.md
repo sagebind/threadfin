@@ -5,6 +5,7 @@ A thread pool for running multiple tasks on a configurable group of threads.
 [![Crates.io](https://img.shields.io/crates/v/threadfin.svg)](https://crates.io/crates/threadfin)
 [![Documentation](https://docs.rs/threadfin/badge.svg)](https://docs.rs/threadfin)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Minimum supported Rust version](https://img.shields.io/badge/rustc-1.51+-yellow.svg)](#minimum-supported-rust-version)
 [![Build](https://github.com/sagebind/threadfin/workflows/ci/badge.svg)](https://github.com/sagebind/threadfin/actions)
 
 Extra features:
@@ -23,6 +24,19 @@ Threadfin supports asynchronous usage via futures, and allows you to mix and mat
 ```rust
 let pool = threadfin::builder().size(8).build();
 ```
+
+## Installation
+
+Install via Cargo by adding to your Cargo.toml file:
+
+[dependencies]
+threadfin = "0.1"
+
+### Minimum supported Rust version
+
+The minimum supported Rust version (or MSRV) for Threadfin is stable Rust 1.51 or greater, meaning we only guarantee that Threadfin will compile if you use a rustc version of at least 1.51. It might compile with older versions but that could change at any time.
+
+This version is explicitly tested in CI and may only be bumped in new minor versions. Any changes to the supported minimum version will be called out in the release notes.
 
 ## Other libraries
 
