@@ -202,7 +202,7 @@ fn join_timeout_expiring() {
 
     // Schedule a slow task on the only thread. We have to keep the task
     // around, because dropping it could cancel the task.
-    let _task = pool.execute(|| thread::sleep(Duration::from_millis(50)));
+    let _task = pool.execute(|| thread::sleep(Duration::from_millis(500)));
 
     // Joining should time out since there's one task still running longer
     // than our join timeout.
