@@ -67,7 +67,7 @@ fn futures_that_yield_are_run_concurrently() {
     // Even though there's only one worker thread, it should become idle quickly
     // and start polling for more work, because a delay future yields
     // immediately and doesn't wake for a while.
-    thread::sleep(Duration::from_millis(10));
+    thread::sleep(Duration::from_millis(100));
 
     assert_eq!(pool.running_tasks(), 1);
 
@@ -75,7 +75,7 @@ fn futures_that_yield_are_run_concurrently() {
         .try_execute_future(Delay::new(Duration::from_millis(100)))
         .unwrap();
 
-    thread::sleep(Duration::from_millis(10));
+    thread::sleep(Duration::from_millis(100));
 
     // Now both tasks are running, but there's still only 1 worker thread!
     assert_eq!(pool.running_tasks(), 2);
@@ -93,7 +93,7 @@ fn try_execute_under_core_count() {
     let pool = ThreadPool::builder().size(1).build();
 
     // Give some time for thread to start...
-    thread::sleep(Duration::from_millis(50));
+    thread::sleep(Duration::from_millis(100));
     assert_eq!(pool.threads(), 1);
 
     assert!(pool.try_execute(|| 2 + 2).is_ok());
