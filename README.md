@@ -22,15 +22,31 @@ Threadfin supports asynchronous usage via futures, and allows you to mix and mat
 ## Examples
 
 ```rust
+// Create a new pool.
 let pool = threadfin::builder().size(8).build();
+
+// Schedule some work.
+let compute_task = pool.execute(|| {
+    // Some expensive computation
+    2 + 2
+});
+
+// Do something in the meantime.
+println!("Waiting for result...");
+
+// Wait for the task to complete and get the result.
+let sum = compute_task.join();
+println!("Sum: 2 + 2 = {}", sum);
 ```
 
 ## Installation
 
 Install via Cargo by adding to your Cargo.toml file:
 
+```toml
 [dependencies]
 threadfin = "0.1"
+```
 
 ### Minimum supported Rust version
 
