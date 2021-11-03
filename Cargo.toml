@@ -1,6 +1,14 @@
 [package]
 name = "threadfin"
 version = "0.1.0"
+description = "A thread pool for running multiple tasks on a configurable group of threads."
+authors = ["Stephen M. Coakley <me@stephencoakley.com>"]
+license = "MIT"
+keywords = ["threadpool", "thread", "pool", "parallel", "async"]
+categories = ["concurrency"]
+repository = "https://github.com/sagebind/threadfin"
+documentation = "https://docs.rs/threadfin/"
+readme = "README.md"
 edition = "2018"
 
 [dependencies]
