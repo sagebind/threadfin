@@ -1,16 +1,15 @@
 use std::{
-    ptr,
-    sync::Arc,
-    task::{RawWaker, RawWakerVTable, Wake, Waker},
+    task::Waker,
     thread::{self, Thread},
 };
 
+use once_cell::sync::Lazy;
+
 /// Creates a dummy waker that does nothing.
 pub(crate) fn empty_waker() -> Waker {
-    const RAW_WAKER: RawWaker = RawWaker::new(ptr::null(), &VTABLE);
-    const VTABLE: RawWakerVTable = RawWakerVTable::new(|_| RAW_WAKER, |_| {}, |_| {}, |_| {});
+    static WAKER: Lazy<Waker> = Lazy::new(|| waker_fn::waker_fn(move || {}));
 
-    unsafe { Waker::from_raw(RAW_WAKER) }
+    WAKER.clone()
 }
 
 /// Creates a waker that unparks the current thread.
@@ -20,17 +19,5 @@ pub(crate) fn current_thread_waker() -> Waker {
 
 /// Creates a waker that unparks a thread.
 pub(crate) fn thread_waker(thread: Thread) -> Waker {
-    struct ThreadWaker(Thread);
-
-    impl Wake for ThreadWaker {
-        fn wake(self: Arc<Self>) {
-            self.0.unpark();
-        }
-
-        fn wake_by_ref(self: &Arc<Self>) {
-            self.0.unpark();
-        }
-    }
-
-    Arc::new(ThreadWaker(thread)).into()
+    waker_fn::waker_fn(move || thread.unpark())
 }

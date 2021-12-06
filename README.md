@@ -50,7 +50,7 @@ threadfin = "0.1"
 
 ### Minimum supported Rust version
 
-The minimum supported Rust version (or MSRV) for Threadfin is stable Rust 1.51 or greater, meaning we only guarantee that Threadfin will compile if you use a rustc version of at least 1.51. It might compile with older versions but that could change at any time.
+The minimum supported Rust version (or MSRV) for Threadfin is stable Rust 1.46 or greater, meaning we only guarantee that Threadfin will compile if you use a rustc version of at least 1.46. It might compile with older versions but that could change at any time.
 
 This version is explicitly tested in CI and may only be bumped in new minor versions. Any changes to the supported minimum version will be called out in the release notes.
 

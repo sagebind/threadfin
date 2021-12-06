@@ -1,4 +1,4 @@
-use std::{collections::HashMap, sync::Arc, task::Wake, time::Duration};
+use std::{collections::HashMap, time::Duration};
 
 use crossbeam_channel::{unbounded, Receiver, Select, Sender};
 
@@ -142,21 +142,12 @@ impl<L: Listener> Worker<L> {
         // If it is possible for this task to yield, we need to prepare a new
         // waker to receive notifications with.
         if coroutine.might_yield() {
-            struct IdWaker(usize, Sender<usize>);
+            let sender = self.wake_notifications.0.clone();
+            let coroutine_addr = coroutine.addr();
 
-            impl Wake for IdWaker {
-                fn wake(self: Arc<Self>) {
-                    self.wake_by_ref();
-                }
-
-                fn wake_by_ref(self: &Arc<Self>) {
-                    let _ = self.1.send(self.0);
-                }
-            }
-
-            coroutine.set_waker(
-                Arc::new(IdWaker(coroutine.addr(), self.wake_notifications.0.clone())).into(),
-            );
+            coroutine.set_waker(waker_fn::waker_fn(move || {
+                let _ = sender.send(coroutine_addr);
+            }));
         }
 
         self.listener.on_task_started();
