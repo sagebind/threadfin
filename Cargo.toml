@@ -20,7 +20,7 @@ waker-fn = "1"
 [dev-dependencies]
 criterion = "0.3"
 futures-timer = "3"
-rusty_pool = "0.6"
+rusty_pool = "0.7"
 threadpool = "1"
 
 [[bench]]
