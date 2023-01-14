@@ -23,10 +23,10 @@ use crate::{
     worker::{Listener, Worker},
 };
 
-#[cfg(target_has_atomic = "64")]
+#[cfg(threadfin_has_atomic64)]
 type AtomicCounter = std::sync::atomic::AtomicU64;
 
-#[cfg(not(target_has_atomic = "64"))]
+#[cfg(not(threadfin_has_atomic64))]
 type AtomicCounter = std::sync::atomic::AtomicU32;
 
 /// A value describing a size constraint for a thread pool.
