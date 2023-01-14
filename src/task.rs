@@ -336,14 +336,14 @@ impl Coroutine {
         F: FnOnce() -> T + Send + 'static,
         T: Send + 'static,
     {
-        (*self
+        self
             .poller
             .into_any()
             .downcast::<ClosurePoller<F, T>>()
-            .unwrap())
-        .closure
-        .take()
-        .unwrap()
+            .unwrap()
+            .closure
+            .take()
+            .unwrap()
     }
 
     /// Unwrap the original future the coroutine was created from. Panics if the
@@ -353,12 +353,12 @@ impl Coroutine {
         F: Future<Output = T> + Send + 'static,
         T: Send + 'static,
     {
-        (*self
+        self
             .poller
             .into_any()
             .downcast::<FuturePoller<F, T>>()
-            .unwrap())
-        .future
+            .unwrap()
+            .future
     }
 }
 

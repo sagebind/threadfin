@@ -8,10 +8,7 @@ jobs:
   test:
     strategy:
       matrix:
-        os:
-          - ubuntu-latest
-          - macos-latest
-          - windows-latest
+        os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 10
     env:
@@ -26,3 +23,27 @@ jobs:
           default: true
 
       - run: cargo test
+
+  cross-compile:
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: armv5te-unknown-linux-gnueabi
+          - os: ubuntu-latest
+            target: mipsel-unknown-linux-gnu
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    env:
+      RUST_BACKTRACE: 1
+    steps:
+      - uses: actions/checkout@v2
+
+      - uses: actions-rs/toolchain@v1
+        with:
+          profile: minimal
+          toolchain: "1.46.0"
+          target: ${{ matrix.target }}
+          default: true
+
+      - run: cargo build --target ${{ matrix.target }}
