@@ -876,7 +876,7 @@ struct Shared {
     thread_count: Mutex<usize>,
     running_tasks_count: AtomicUsize,
     completed_tasks_count: AtomicCounter,
-    panicked_tasks_count: std::sync::atomic::AtomicU64,
+    panicked_tasks_count: AtomicCounter,
     keep_alive: Duration,
     shutdown_cvar: Condvar,
 }
