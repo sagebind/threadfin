@@ -1,0 +1,19 @@
+[package]
+name = "threadfin-benchmarks"
+version = "0.0.0"
+authors = ["Stephen M. Coakley <me@stephencoakley.com>"]
+license = "MIT"
+edition = "2018"
+
+[dependencies.threadfin]
+path = ".."
+
+[dev-dependencies]
+criterion = "0.3"
+num_cpus = "1"
+rusty_pool = "0.7"
+threadpool = "1"
+
+[[bench]]
+name = "pool"
+harness = false

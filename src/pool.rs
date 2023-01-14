@@ -540,18 +540,20 @@ impl ThreadPool {
     /// let pool = threadfin::ThreadPool::new();
     /// assert_eq!(pool.panicked_tasks(), 0);
     ///
-    /// pool.execute(|| {
+    /// let task = pool.execute(|| {
     ///     panic!("this task panics");
     /// });
     ///
-    /// sleep(Duration::from_millis(100));
+    /// while !task.is_done() {
+    ///     sleep(Duration::from_millis(100));
+    /// }
     ///
     /// assert_eq!(pool.panicked_tasks(), 1);
     /// ```
     #[inline]
     #[allow(clippy::useless_conversion)]
     pub fn panicked_tasks(&self) -> u64 {
-        self.shared.panicked_tasks_count.load(Ordering::Relaxed).into()
+        self.shared.panicked_tasks_count.load(Ordering::SeqCst).into()
     }
 
     /// Submit a closure to be executed by the thread pool.
@@ -794,7 +796,7 @@ impl ThreadPool {
                 if panicked {
                     self.shared
                         .panicked_tasks_count
-                        .fetch_add(1, Ordering::Relaxed);
+                        .fetch_add(1, Ordering::SeqCst);
                 }
             }
 
@@ -874,7 +876,7 @@ struct Shared {
     thread_count: Mutex<usize>,
     running_tasks_count: AtomicUsize,
     completed_tasks_count: AtomicCounter,
-    panicked_tasks_count: AtomicCounter,
+    panicked_tasks_count: std::sync::atomic::AtomicU64,
     keep_alive: Duration,
     shutdown_cvar: Condvar,
 }

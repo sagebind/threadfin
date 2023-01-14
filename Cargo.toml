@@ -18,11 +18,7 @@ once_cell = ">=1.0, <=1.14"
 waker-fn = "1"
 
 [dev-dependencies]
-criterion = ">=0.3.0, <=0.3.5"
 futures-timer = "3"
-rusty_pool = "0.7"
-threadpool = "1"
 
-[[bench]]
-name = "pool"
-harness = false
+[workspace]
+members = ["benchmarks"]
