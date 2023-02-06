@@ -49,7 +49,7 @@ fn task_join_timeout() {
     let pool = single_thread();
 
     let result = pool
-        .execute(|| thread::sleep(Duration::from_millis(50)))
+        .execute(|| thread::sleep(Duration::from_secs(5)))
         .join_timeout(Duration::from_millis(10));
 
     assert!(result.is_err());
