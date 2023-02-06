@@ -1,6 +1,6 @@
 [package]
 name = "threadfin"
-version = "0.1.1"
+version = "0.1.2"
 description = "A thread pool for running multiple tasks on a configurable group of threads."
 authors = ["Stephen M. Coakley <me@stephencoakley.com>"]
 license = "MIT"
