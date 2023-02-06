@@ -14,6 +14,7 @@ fn name_with_null_bytes_panics() {
 }
 
 #[test]
+#[allow(clippy::reversed_empty_ranges)]
 #[should_panic(expected = "thread pool minimum size cannot be larger than maximum size")]
 fn invalid_size_panics() {
     ThreadPool::builder().size(2..1);

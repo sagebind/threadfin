@@ -5,7 +5,7 @@ use std::{
     future::Future,
     ops::{Range, RangeInclusive, RangeTo, RangeToInclusive},
     sync::{
-        atomic::{AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicUsize, Ordering},
         Arc,
         Condvar,
         Mutex,
@@ -22,6 +22,12 @@ use crate::{
     task::{Coroutine, Task},
     worker::{Listener, Worker},
 };
+
+#[cfg(threadfin_has_atomic64)]
+type AtomicCounter = std::sync::atomic::AtomicU64;
+
+#[cfg(not(threadfin_has_atomic64))]
+type AtomicCounter = std::sync::atomic::AtomicU32;
 
 /// A value describing a size constraint for a thread pool.
 ///
@@ -516,8 +522,9 @@ impl ThreadPool {
     /// assert_eq!(pool.completed_tasks(), 2);
     /// ```
     #[inline]
+    #[allow(clippy::useless_conversion)]
     pub fn completed_tasks(&self) -> u64 {
-        self.shared.completed_tasks_count.load(Ordering::Relaxed)
+        self.shared.completed_tasks_count.load(Ordering::Relaxed).into()
     }
 
     /// Get the number of tasks that have panicked since the pool was created.
@@ -533,17 +540,20 @@ impl ThreadPool {
     /// let pool = threadfin::ThreadPool::new();
     /// assert_eq!(pool.panicked_tasks(), 0);
     ///
-    /// pool.execute(|| {
+    /// let task = pool.execute(|| {
     ///     panic!("this task panics");
     /// });
     ///
-    /// sleep(Duration::from_millis(100));
+    /// while !task.is_done() {
+    ///     sleep(Duration::from_millis(100));
+    /// }
     ///
     /// assert_eq!(pool.panicked_tasks(), 1);
     /// ```
     #[inline]
+    #[allow(clippy::useless_conversion)]
     pub fn panicked_tasks(&self) -> u64 {
-        self.shared.panicked_tasks_count.load(Ordering::Relaxed)
+        self.shared.panicked_tasks_count.load(Ordering::SeqCst).into()
     }
 
     /// Submit a closure to be executed by the thread pool.
@@ -786,7 +796,7 @@ impl ThreadPool {
                 if panicked {
                     self.shared
                         .panicked_tasks_count
-                        .fetch_add(1, Ordering::Relaxed);
+                        .fetch_add(1, Ordering::SeqCst);
                 }
             }
 
@@ -865,8 +875,8 @@ struct Shared {
     max_threads: usize,
     thread_count: Mutex<usize>,
     running_tasks_count: AtomicUsize,
-    completed_tasks_count: AtomicU64,
-    panicked_tasks_count: AtomicU64,
+    completed_tasks_count: AtomicCounter,
+    panicked_tasks_count: AtomicCounter,
     keep_alive: Duration,
     shutdown_cvar: Condvar,
 }

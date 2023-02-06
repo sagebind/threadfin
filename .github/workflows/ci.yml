@@ -8,11 +8,14 @@ jobs:
   test:
     strategy:
       matrix:
-        os:
-          - ubuntu-latest
-          - macos-latest
-          - windows-latest
-    runs-on: ${{ matrix.os }}
+        include:
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - runner: macos-11
+            target: x86_64-apple-darwin
+          - runner: windows-latest
+            target: x86_64-pc-windows-msvc
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 10
     env:
       RUST_BACKTRACE: 1
@@ -23,6 +26,31 @@ jobs:
         with:
           profile: minimal
           toolchain: "1.46.0"
+          target: ${{ matrix.target }}
           default: true
 
-      - run: cargo test
+      - run: cargo test --target ${{ matrix.target }}
+
+  cross-compile:
+    strategy:
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            target: armv5te-unknown-linux-gnueabi
+          - runner: ubuntu-latest
+            target: mipsel-unknown-linux-gnu
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 10
+    env:
+      RUST_BACKTRACE: 1
+    steps:
+      - uses: actions/checkout@v2
+
+      - uses: actions-rs/toolchain@v1
+        with:
+          profile: minimal
+          toolchain: "1.46.0"
+          target: ${{ matrix.target }}
+          default: true
+
+      - run: cargo build --target ${{ matrix.target }}
