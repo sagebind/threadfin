@@ -9,7 +9,7 @@ edition = "2018"
 path = ".."
 
 [dev-dependencies]
-criterion = "0.3"
+criterion = "0.5"
 num_cpus = "1"
 rusty_pool = "0.7"
 threadpool = "1"
